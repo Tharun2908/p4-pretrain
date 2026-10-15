@@ -1,0 +1,13 @@
+# p4 dependencies — edit THIS file, never requirements.lock by hand.
+# After editing:  bash setup_env.sh --relock   (then commit both files)
+#
+# torch: the PyPI 2.8.0 wheels are CUDA 12.8 builds and carry kernels for sm_80 (A100), sm_90 (H100/H200) and sm_100 (B200),
+# so ONE env runs on every GPU in the cluster. Bump deliberately, never implicitly.
+torch==2.8.0
+numpy
+tiktoken
+datasets
+tqdm
+matplotlib
+pyyaml
+# transformer_engine: deliberately absent until M6. See DEC-007.

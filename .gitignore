@@ -1,0 +1,15 @@
+# bytecode — without this, merely importing bench.py makes the tree "dirty"
+__pycache__/
+*.pyc
+
+# large artifacts: live on the PVC, never in git
+checkpoints/
+data/
+*.bin
+*.pt
+*.safetensors
+logs/*.txt
+logs/*.log
+logs/*.json.gz
+
+# runs/*.json and plots/*.png are deliberately NOT ignored: they are the evidence
