@@ -1,0 +1,86 @@
+{
+  "run_id": "M0-001",
+  "milestone": "M0",
+  "question": "Do 4 ranks initialize, is all-reduce correct, and what bandwidth does the PyTorch/NCCL stack actually deliver?",
+  "prediction": "your number here",
+  "strategy": "allreduce-bench",
+  "precision": "fp32",
+  "config": {
+    "world_size": 4,
+    "dtype": "fp32",
+    "timing": "max across ranks",
+    "warmup": 5,
+    "iters": 20
+  },
+  "env": {
+    "hostname": "p4-training-a100",
+    "gpu_name": "NVIDIA A100-SXM4-40GB",
+    "torch": "2.4.1+cu124",
+    "cuda": "12.4",
+    "nccl": "2.20.5",
+    "NCCL_DEBUG": ""
+  },
+  "metrics": {
+    "peak_busbw_GBps": 195.3,
+    "peak_algbw_GBps": 130.2,
+    "sweep": [
+      {
+        "bytes": 1048576,
+        "algbw_GBps": 12.5,
+        "busbw_GBps": 18.8
+      },
+      {
+        "bytes": 2097152,
+        "algbw_GBps": 22.7,
+        "busbw_GBps": 34.0
+      },
+      {
+        "bytes": 4194304,
+        "algbw_GBps": 46.3,
+        "busbw_GBps": 69.5
+      },
+      {
+        "bytes": 8388608,
+        "algbw_GBps": 61.6,
+        "busbw_GBps": 92.4
+      },
+      {
+        "bytes": 16777216,
+        "algbw_GBps": 72.4,
+        "busbw_GBps": 108.6
+      },
+      {
+        "bytes": 33554432,
+        "algbw_GBps": 99.9,
+        "busbw_GBps": 149.9
+      },
+      {
+        "bytes": 67108864,
+        "algbw_GBps": 107.5,
+        "busbw_GBps": 161.3
+      },
+      {
+        "bytes": 134217728,
+        "algbw_GBps": 109.4,
+        "busbw_GBps": 164.1
+      },
+      {
+        "bytes": 268435456,
+        "algbw_GBps": 124.4,
+        "busbw_GBps": 186.7
+      },
+      {
+        "bytes": 536870912,
+        "algbw_GBps": 130.2,
+        "busbw_GBps": 195.3
+      }
+    ],
+    "contention_processes": [
+      "3611151, 12 MiB, GPU-9d4c1b9a-bc9d-c1fa-f933-56ae2cefc820",
+      "3611152, 12 MiB, GPU-4459951b-4764-0e42-ed8a-88da97645933",
+      "3611153, 12 MiB, GPU-58552fa8-9ddb-a0a2-1de0-bbda38258c5b"
+    ]
+  },
+  "outcome": "Strong intra-node collective bandwidth, consistent with NVLink/NVSwitch. Proceed to M1.",
+  "started_at": "2026-08-02T17:27:36"
+}
