@@ -10,4 +10,5 @@ datasets
 tqdm
 matplotlib
 pyyaml
+pytest
 # transformer_engine: deliberately absent until M6. See DEC-007.

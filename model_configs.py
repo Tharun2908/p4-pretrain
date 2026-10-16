@@ -39,9 +39,10 @@ class GPTConfig:
     def n_params(self) -> int:
         """Total params, lm_head tied to wte (counted once). Estimate until model.py exists."""
         d, b = self.n_embd, int(self.bias)
-        per_layer = 12 * d * d + b * 9 * d + 4 * d          # qkv+proj+mlp weights, biases, 2 LNs
+        # weights 12d² (qkv 3d² + proj d² + mlp 8d²) · linear biases 9d · 2 LNs of (1+b)d each
+        per_layer = 12 * d * d + b * 9 * d + 2 * (1 + b) * d
         return (self.vocab_size * d + self.block_size * d   # wte + wpe
-                + self.n_layer * per_layer + 2 * d)          # blocks + final LN
+                + self.n_layer * per_layer + (1 + b) * d)    # blocks + final LN
 
     @property
     def n_params_non_embedding(self) -> int:
