@@ -144,17 +144,26 @@ line("bf16 matmul", "ok")
 # backend is the ISSUE-002 failure pattern; M1 pins one explicitly based on this list.
 from torch.nn.attention import sdpa_kernel, SDPBackend
 import torch.nn.functional as F
-q = torch.randn(1, 16, 1024, 128, device="cuda", dtype=torch.bfloat16)
+# Probe forward AND backward: training needs both, and a backend can support the forward
+# pass while failing the backward one. Shape = the 1.3B model's attention (16 heads x 128).
 avail = []
 for be in (SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
            SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH):
+    q, k, v = (torch.randn(2, 16, 1024, 128, device="cuda", dtype=torch.bfloat16,
+                           requires_grad=True) for _ in range(3))
+    status = None
     try:
         with sdpa_kernel(be):
-            F.scaled_dot_product_attention(q, q, q, is_causal=True)
-        torch.cuda.synchronize()
-        avail.append(be.name)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            torch.cuda.synchronize()
+            status = "fwd-only"
+            out.sum().backward()
+            torch.cuda.synchronize()
+            status = "fwd+bwd"
     except Exception:
         pass
+    if status:
+        avail.append(f"{be.name}({status})")
 line("sdpa backends", ", ".join(avail) or "NONE")
 sys.exit(0 if ok else 1)
 PY
