@@ -55,14 +55,14 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M# | Label | GPUs | Status | Blocking |
 |----|-------|------|--------|----------|
 | M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ✅ 1×B200 env verified · ⬜ 4×B200 NCCL rerun | 4-GPU session |
-| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | 🟡 33 B200 tests pass; eager + compiled tiny CUDA smokes pass; measured runs pending | Pre-run predictions drafted; commit next |
+| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; tiny CUDA smokes; five measured B200 baselines complete | — |
 | M2 | Data pipeline (tokenize→dedup→filter→pack→shard) | **0** (CPU) | ⬜ not started | — |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ⬜ not started | M1, M2 |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
 | M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
-| M8 | `docs/training.md` + README + writeup | 0 | ⬜ not started | M4, M7 |
+| M8 | `docs/training.md` + README + writeup | 0 | 🟡 M1 results section drafted; final writeup pending | M4, M7 |
 
 **Never cut:** M3, M4, M7, one clean from-scratch loss curve (125M), one diagnosed instability.
 
@@ -174,32 +174,93 @@ transferring at three-quarters of achievable bandwidth.
 
 ### M1 integration checks — 2026-10-31 (SMOKE ONLY; NOT performance baselines)
 
-- **Hardware / code:** 1× NVIDIA B200, `cl-worker36`; driver 580.196.07; PyTorch 2.8.0+cu128; pytest 9.2.0; Git commit `3b21eb7`.
-- **Correctness:** 33 tests passed, 0 skipped, on B200 (`python -m pytest -q -rs`).
-- **Eager / auto SDPA:** `gpt-tiny`, micro_bs=4, block=64, 40 steps, 20 warmup steps; profiler observed Flash Attention forward and backward; 78,108 tok/s, 3.7 s first step (includes first-touch overhead), peak 0.2 GB, loss 10.8577→10.1794.
-- **Compiled / cuDNN SDPA:** identical tiny config with `--compile --backend cudnn`; profiler observed cuDNN forward and backward; 80,973 tok/s, 14.1 s first step (includes compile and first-touch overhead), peak 0.2 GB, loss 10.8566→10.1776.
-- **Interpretation:** CUDA integration, optimizer, kernel selection, and timing work. Different modes *and* attention backends; tiny-model throughput is not a measured M1 headline or an isolated compiler speedup. Compiler (`gcc`/`g++`) is a container prerequisite for `torch.compile`; apt-installed tools may disappear on pod recreation.
+- **Hardware / code:** 1× NVIDIA B200, `cl-worker36`; driver 580.196.07; PyTorch 2.8.0+cu128; pytest 9.2.0; initial GPU validation at commit `3b21eb7`.
+- **Correctness:** 33 tests passed, 0 skipped (`python -m pytest -q -rs`).
+- **Eager / auto SDPA:** `gpt-tiny`, micro_bs=4, block=64, 40 steps, 20 warmup steps; profiler verified Flash forward and backward; 78,108 tok/s, first step 3.7s, peak 0.2 GB; loss 10.8577→10.1794.
+- **Compiled / cuDNN SDPA:** same tiny config, `--compile --backend cudnn`; profiler verified cuDNN forward and backward; 80,973 tok/s, first step 14.1s, peak 0.2 GB; loss 10.8566→10.1776.
+- **Caveat:** differing attention backends mean tiny-run speed difference is **not** an isolated compile benefit. First-step times contain compilation, autotuning and first-touch overhead. The container needed a C compiler (`gcc`/`g++`) for Triton; apt-installed system compilers are not persisted on the PVC after pod recreation.
 
-### RUN M1-001…005 — single-B200 MFU: 125M vs 1.3B, eager vs `torch.compile` + attention ablation
+### M1-001…005 — registered predictions and measurement protocol
 
-- **Prediction recorded:** 2026-10-31, **before any measured 125M/1.3B runs**. These are hypotheses, not observations. Adjust only *before* seeing relevant benchmark throughput and record the reason.
-- **Date / HW:** measured date TBD · **1×B200** · BF16 autocast · vocab 50304 · fused AdamW · block 1024 · synthetic on-device batches (no input pipeline).
-- **Precommitted benchmark protocol:** `--micro-bs 16 --grad-accum 1 --steps 200 --bench-warmup 50 --log-every 10 --seed 1337`, identical for both model sizes unless the 1.3B configuration fails to fit. Eager and compiled use `--backend flash` in M1-001…004; M1-005 changes *only* backend to `cudnn` versus M1-004. Log exceptions before reviewing throughput results.
-- **Question:** how much of one B200 does a 125M model use vs a 1.3B model? How much of the eager→compiled gain comes from reducing non-matmul / launch overhead? Which attention backend wins at 1.3B?
-- **PREDICTIONS (all pre-benchmark):**
-  - **M1-001 — 125M eager / Flash:** **5% MFU (~132,000 tok/s)**. Narrow 768-wide layers and relatively short operations likely leave the fast B200 underutilized, especially outside matmuls.
-  - **M1-002 — 125M compiled / Flash:** **8% MFU (~211,000 tok/s; +60% vs eager)**. Fusion and fewer Python/kernel-launch boundaries should have larger relative effect at small model width; magnitude is deliberately falsifiable.
-  - **M1-003 — 1.3B eager / Flash:** **15% MFU (~40,000 tok/s)**. Wider 2048-dimensional matmuls should use tensor cores more efficiently, increasing MFU despite a lower token rate.
-  - **M1-004 — 1.3B compiled / Flash:** **20% MFU (~53,000 tok/s; +33% vs eager)**. Fusion still helps, but large matrix compute already dominates more of each training step.
-  - **M1-005 — 1.3B compiled / cuDNN vs Flash:** **cuDNN ~5% faster** (~56,000 vs ~53,000 tok/s), hypothesis with low confidence. Shape-specialized cuDNN SDPA may be advantageous at head_dim=128, but Flash could win; verified profiler kernel identities are required for both runs.
-- **Arithmetic / denominator:** `peak=2.25e15` dense BF16 FLOP/s per B200; `model_configs.py` gives ~0.855G FLOPs/token for 125M and ~8.47G FLOPs/token for 1.3B. Therefore `tok/s = (MFU / 100) × 2.25e15 / FLOPs_per_token`. Same-batch-size design reduces one confound across model sizes; any MFU difference can still include kernel shape / launch effects, not just parameter count.
-- **Actual:** _fill after the measured runs; include tok/s, MFU, peak GB and backend kernels for each run_
-- **Gap vs prediction:** _fill after measured runs; investigate deviations, especially >20%_
-- **Artifacts:** `runs/M1-001.json` … `runs/M1-005.json` (produced by `train.py` for measured runs only)
+- **Prediction recorded:** 2026-10-31, **before the first measured 125M/1.3B run**. Original hypotheses remain unchanged below. Subsequent *revised* expectations were recorded in the respective run's `--prediction` string after earlier results were known; they are marked as conditional updates and are not substituted for the original priors.
+- **Hardware / precision:** 1× B200, `cl-worker36`, BF16 autocast; dense BF16 peak denominator = 2.25e15 FLOP/s; GPT-125M ≈ 0.855G estimated training FLOPs/token, GPT-1.3B ≈ 8.47G.
+- **Controlled protocol:** `--micro-bs 16 --grad-accum 1 --steps 200 --bench-warmup 50 --log-every 10`, sequence length 1024, synthetic on-device batches (16,384 tokens/optimizer step), fused AdamW, 150 measured steps; eager/compiled pairs explicitly use Flash. M1-005 changes *only* the attention backend to cuDNN relative to M1-004. Each run profiles observed fused attention operations.
+- **Original pre-benchmark predictions:**
+  - **M1-001, 125M eager/Flash:** 5% MFU, ≈132K tok/s; anticipated poor utilization from narrower layers and overhead.
+  - **M1-002, 125M compiled/Flash:** 8% MFU, ≈211K tok/s, ≈+60% throughput over eager; expected kernel fusion to help a small model.
+  - **M1-003, 1.3B eager/Flash:** 15% MFU, ≈40K tok/s; expected improved MFU, lower tok/s.
+  - **M1-004, 1.3B compiled/Flash:** 20% MFU, ≈53K tok/s, ≈+33% over eager; expected relatively less compiler gain than 125M.
+  - **M1-005, 1.3B compiled/cuDNN:** cuDNN ≈5% faster than Flash, low confidence; shape-specific fused attention kernels might help. Original magnitude depended on original M1-004 estimate, not yet measured values.
 
-> Interpretation rule: 125M↔1.3B compares model sizes on the same hardware and batch size;
-> eager↔compiled compares execution modes at a fixed size and attention backend; M1-004↔005
-> isolates the SDPA backend. The tiny smoke runs above answer none of these three causal questions.
+| Run | Model | Mode / observed attention | Predicted MFU | Actual tok/s | Actual MFU | Step p50* | Peak allocated | First step** |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| M1-001 | 125M | Eager / Flash | 5% | **461,503** | **17.54%** | 35.4 ms | 17.2 GB | 1.0 s |
+| M1-002 | 125M | Compiled / Flash | 8% | **685,273** | **26.05%** | 23.9 ms | 12.3 GB | 11.8 s |
+| M1-003 | 1.3B | Eager / Flash | 15% | **91,087** | **34.30%** | 179.6 ms | 57.5 GB | 1.7 s |
+| M1-004 | 1.3B | Compiled / Flash | 20% | **105,819** | **39.85%** | 154.9 ms | 52.8 GB | 23.2 s |
+| M1-005 | 1.3B | Compiled / cuDNN | +5% vs Flash | **113,663** | **42.81%** | 143.9 ms | 52.8 GB | 3.4 s (warm cache) |
+
+*Step-time p50 and p95 are calculated from **averages of 10-step windows**, not individually instrumented steps. **First-step timing includes compile/autotune/initialization, and cache state differs across runs; the M1-005 3.4 s first step is warm-cache and cannot be compared as cold compilation cost.*
+
+### RUN M1-001 — GPT-125M eager BF16 / Flash, 1×B200
+
+- **Question:** Single-GPU baseline throughput, MFU, memory at 125M.
+- **PREDICTION (original):** 5% MFU, 132,000 tok/s, ≈124 ms/step.
+- **Actual:** **461,503 tok/s**, **17.54% MFU**, **35.4 ms window-mean p50**, **17.2 GB peak allocated**; first step **1.0s**; loss 10.9790→5.6386 on repeated synthetic batches.
+- **Gap vs prediction:** **3.50×** higher tok/s (≈+250%) and 3.51× expected MFU. The simple small-model utilization prior was too pessimistic; 16,384 token positions create substantial matmul parallel work. This is a **hypothesis about why**, not attribution established through per-op profiling.
+- **Backend evidence:** profiler observed Flash forward and backward.
+- **Artifact:** `runs/M1-001.json`.
+
+### RUN M1-002 — GPT-125M compiled BF16 / Flash, 1×B200
+
+- **Question:** How much does `torch.compile` change steady-state performance at 125M when the attention backend is held fixed?
+- **PREDICTION (original):** 8% MFU, ≈211,000 tok/s. **Conditional revision (after M1-001, before M1-002):** 18–22% MFU, modest improvement over observed eager baseline.
+- **Actual:** **685,273 tok/s**, **26.05% MFU**, **23.9 ms window-mean p50**, **12.3 GB peak allocated**, first step **11.8s**.
+- **Gap:** **3.25×** original tok/s prediction; also above revised 18–22% MFU band. Versus M1-001: **+48.5% throughput (1.485×)**, **+8.51 percentage points MFU**, and **−28.5% peak allocated memory**.
+- **Interpretation:** Compiler optimization materially improved this fixed workload. Kernel fusion, memory traffic and launch amortization are plausible causes, but exact causal attribution requires M7 profiling.
+- **Backend evidence:** profiler observed Flash forward and backward.
+- **Artifact:** `runs/M1-002.json`.
+
+### RUN M1-003 — GPT-1.3B eager BF16 / Flash, 1×B200
+
+- **Question:** Does increasing model width/depth improve MFU despite lowering token throughput?
+- **PREDICTION (original):** 15% MFU, ≈40,000 tok/s (≈410 ms/step).
+- **Actual:** **91,087 tok/s**, **34.30% MFU**, **179.6 ms window-mean p50**, **57.5 GB peak allocated**; first step **1.7s**; loss 11.2096→10.1926 on repeated synthetic batches.
+- **Gap:** **2.28×** original tok/s prediction, ≈2.29× predicted MFU. Compared with 125M eager, MFU is **1.96× higher** while tok/s is **≈5.07× lower**.
+- **Interpretation:** Larger-matrix utilization plausibly explains the MFU improvement; no per-operator profile has isolated the cause. Synthetic repeated data is not a quality/generalization metric.
+- **Backend evidence:** profiler observed Flash forward and backward.
+- **Artifact:** `runs/M1-003.json`.
+
+### RUN M1-004 — GPT-1.3B compiled BF16 / Flash, 1×B200
+
+- **Question:** Does the same compiler optimization yield a smaller *relative* speedup at 1.3B than at 125M?
+- **PREDICTION (original):** 20% MFU, ≈53,000 tok/s. **Conditional revision (after M1-003, before M1-004):** 38–45% MFU (≈101–120K tok/s).
+- **Actual:** **105,819 tok/s**, **39.85% MFU**, **154.9 ms window-mean p50**, **52.8 GB peak allocated**, first step **23.2s**.
+- **Gap:** **2.00×** original tok/s prediction, but within conditional revised band. Versus M1-003: **+16.2% throughput (1.162×)**, **+5.55 points MFU**, **−8.2% peak allocated memory**.
+- **Interpretation:** Larger model shows less relative compilation gain than 125M under the same benchmark protocol; profile in M7 to test whether compute/launch balance explains the difference.
+- **Observation:** cumulative throughput drifted from ~107.6K to 105.8K tok/s during the 150 measured steps; cause unknown.
+- **Backend evidence:** profiler observed Flash forward and backward.
+- **Artifact:** `runs/M1-004.json`.
+
+### RUN M1-005 — GPT-1.3B compiled BF16 / cuDNN, 1×B200
+
+- **Question:** Is cuDNN faster than Flash for this specific compiled model shape, with all other settings held constant?
+- **PREDICTION (original):** cuDNN ≈5% faster than Flash, low confidence. **Conditional magnitude (after M1-004):** ~111,000 tok/s, 41.8% MFU.
+- **First attempt:** profiler saw **Flash** despite `--backend cudnn` and `verify_backend` aborted before measured windows; **not a valid cuDNN result**. See ISSUE-004.
+- **Diagnostic:** with `TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/p4-inductor/m1-005-cudnn`, a separate 10-step dry run confirmed cuDNN forward/backward, 114,949 tok/s (diagnostic only; no warmup).
+- **Actual (200 steps / 50 warmup / 150 measured):** **113,663 tok/s**, **42.81% MFU**, **143.9 ms window-mean p50**, **52.8 GB peak allocated**, first step **3.4s with cached compilation**.
+- **Gap:** **+7.41% cuDNN versus Flash** at the same compiled GPT-1.3B configuration, versus predicted +5% (difference +2.41 percentage points). Conditional 111K throughput prediction was within ~2.4% of measured result.
+- **Backend evidence:** profiler saw `aten::_scaled_dot_product_cudnn_attention` and backward; kernel names included `cudnn_generated_...sm100...`.
+- **Artifact:** `runs/M1-005.json`.
+
+### M1 synthesis — supported findings, caveats, and next action
+
+- **Model-size effect:** Eager MFU rose **17.54% → 34.30%** when switching from 125M to 1.3B with the same batch/sequence configuration, while tok/s fell **461.5K → 91.1K**. This is a fixed-configuration observation, not a universal law that larger models yield higher MFU.
+- **Compiler effect:** at fixed size and Flash backend, `torch.compile` improved steady-state throughput **1.485× at 125M** versus **1.162× at 1.3B**; peak allocated memory fell **28.5%** and **8.2%**, respectively. Root causes require per-op profiling later in M7.
+- **Backend effect:** cuDNN beat Flash by **7.41%** at compiled GPT-1.3B (head_dim 128, sequence length 1024). This result does not generalize to other shapes or PyTorch/cuDNN versions without testing.
+- **Measurement limits:** one full measured run per configuration; no across-run error bars; 150 measured optimizer steps per run, 10-step averaged windows, hardware vendor theoretical BF16 peak as MFU denominator; on-device **repeated synthetic** batches remove input pipeline costs and do not assess language-model quality. `torch.cuda.max_memory_allocated()` reports allocated memory, not reserved/system-wide usage. A full tokenized real-data loss curve remains a separate M2+ deliverable.
+- **Reproducibility:** original predictions were preserved. Successful runs verified the *executed* attention backend, not only the requested flag. First-step timings include first touch/autotuning and potentially cached compilation; don't treat them as pure compile latency.
+- **Close M1:** preserve five JSON artifacts and documentation in Git; defer detailed bottleneck attribution and repeated confidence intervals to M7. **Next: M2 CPU data pipeline** (tokenize, dedup, quality-filter, pack, shard); release the 1-GPU pod once artifacts are committed.
 
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
@@ -305,6 +366,17 @@ that's the field that makes it a story.
   real training produces; and a test threshold derived by reasoning is a hypothesis — I'd flagged these
   two tests as "most likely to need calibration," which was the right suspicion for the wrong reason.
   Interview-usable: *tied embeddings give an untrained model a structural prior toward copying its input.*
+
+### ISSUE-004 — Requested cuDNN, but compiled GPT-1.3B executed Flash from cache
+
+- **Date / HW:** 2026-10-31 · 1×B200 (`cl-worker36`), PyTorch 2.8.0+cu128.
+- **Symptom (exact):** M1-005 started with `--compile --backend cudnn`, but the profiler recorded `aten::_scaled_dot_product_flash_attention` and Flash backward; `verify_backend` raised `RuntimeError: requested backend 'cudnn' not confirmed by the profiler` *before* any measured window. That failed attempt is not a valid cuDNN benchmark.
+- **Observations:** Previous run M1-004 compiled the same GPT-1.3B graph with Flash; failing M1-005 first step took ~3.1s versus 23.2s on earlier compiled Flash run. A diagnostic after isolating Inductor cache took ~21.7s on first step and showed cuDNN operations. Full isolated-cache run completed and verified cuDNN, yielding 113,663 tok/s.
+- **Leading hypothesis (not fully proven):** Inductor graph/cache reuse failed to reflect the requested SDPA backend when the model shape remained the same. A short first step and the resolution with cache isolation are consistent with stale compiled graph reuse; they are not by themselves proof of the exact upstream cache-key defect.
+- **Fix / mitigation:** use an isolated `TORCHINDUCTOR_CACHE_DIR` for each compiled backend (e.g. `/workspace/.cache/p4-inductor/m1-005-cudnn`); keep `verify_backend` as a hard failure for measured runs; never rename a Flash run as cuDNN.
+- **Generalizable lesson:** a configuration flag expresses intent; the profiler reveals what executed. In systems experiments, guard the validity of the independent variable **before** collecting headline metrics.
+- **Follow-up (optional):** reproduce the mismatch with fresh and warm caches under identical code, inspect compile cache key behavior and backend versions; fix permanently in setup/runtime or upgrade after controlled validation. Not needed to close M1.
+
 
 ---
 
@@ -514,8 +586,8 @@ _Future pitch template only; do not present these milestones as completed until 
 |---|---|
 | Scaling efficiency at 4 GPUs? | DDP hit __× of ideal 4×; gap is all-reduce grad sync, held down by NVLink at __ GB/s busbw |
 | What did ZeRO-3 cost you? | −__% throughput for −__% peak memory; on a model that fits, DDP wins — FSDP is a big-model tool |
-| MFU story? | 125M went __% → __% after __; bottleneck was __, found via __ |
+| MFU story? | M1 single B200 GPT-125M eager 17.54% → compiled 26.05%; steady-state +48.5% tok/s; exact bottleneck attribution deferred to M7 |
 | Fault tolerance? | Checkpoint/resume survives a mid-run `kill -9`; tested by __ at step __, resumed to identical loss trajectory |
 | fp8? | __× throughput over bf16 at __ loss delta; watched range/overflow in __ |
-| Hardest bug? | ISSUE-__ |
+| Hardest bug? | ISSUE-004: requested cuDNN but compiler cache reused Flash; profiler guard caught backend mismatch |
 | Something that didn't work? | NEG-__ |
