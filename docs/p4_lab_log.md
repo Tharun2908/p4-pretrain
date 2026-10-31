@@ -54,8 +54,8 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 
 | M# | Label | GPUs | Status | Blocking |
 |----|-------|------|--------|----------|
-| M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ⬜ B200 rerun | `setup_env.sh` on 1×B200 |
-| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | 🟡 next | env |
+| M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ✅ 1×B200 env verified · ⬜ 4×B200 NCCL rerun | 4-GPU session |
+| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | 🟡 33 B200 tests pass; eager + compiled tiny CUDA smokes pass; measured runs pending | Pre-run predictions drafted; commit next |
 | M2 | Data pipeline (tokenize→dedup→filter→pack→shard) | **0** (CPU) | ⬜ not started | — |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ⬜ not started | M1, M2 |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
@@ -172,24 +172,34 @@ transferring at three-quarters of achievable bandwidth.
 > gap is gradient all-reduce — which I know cost me X ms/step because I measured the bus at
 > Y GB/s" is a complete answer. Without this number you're guessing.
 
-### RUN M1-001…004 — single-B200 MFU: 125M vs 1.3B, eager vs `torch.compile`
+### M1 integration checks — 2026-10-31 (SMOKE ONLY; NOT performance baselines)
 
-- **Date / HW:** TBD · **1×B200** · bf16 autocast · SDPA backend pinned (from `setup_env.sh` list) ·
-  vocab 50304 · fused AdamW · block 1024 · micro-batch: largest that fits, recorded
-- **Question:** how much of one B200 does a 125M model use vs a 1.3B one, and how much of the gap
-  is the non-matmul tail that `torch.compile` exists to fuse?
-- **PREDICTION (write BEFORE launch — four numbers + one sentence of reasoning each):**
-  - 125M eager: __% MFU (__ tok/s) — because __
-  - 125M compiled: __% — because __
-  - 1.3B eager: __% — because __
-  - 1.3B compiled: __% — because __
-  - *Helper:* `python model_configs.py` → FLOPs/token. tok/s = MFU × 2.25e15 / FLOPs/token.
-- **Actual:** _fill in_
-- **Gap vs prediction:** _fill in_
+- **Hardware / code:** 1× NVIDIA B200, `cl-worker36`; driver 580.196.07; PyTorch 2.8.0+cu128; pytest 9.2.0; Git commit `3b21eb7`.
+- **Correctness:** 33 tests passed, 0 skipped, on B200 (`python -m pytest -q -rs`).
+- **Eager / auto SDPA:** `gpt-tiny`, micro_bs=4, block=64, 40 steps, 20 warmup steps; profiler observed Flash Attention forward and backward; 78,108 tok/s, 3.7 s first step (includes first-touch overhead), peak 0.2 GB, loss 10.8577→10.1794.
+- **Compiled / cuDNN SDPA:** identical tiny config with `--compile --backend cudnn`; profiler observed cuDNN forward and backward; 80,973 tok/s, 14.1 s first step (includes compile and first-touch overhead), peak 0.2 GB, loss 10.8566→10.1776.
+- **Interpretation:** CUDA integration, optimizer, kernel selection, and timing work. Different modes *and* attention backends; tiny-model throughput is not a measured M1 headline or an isolated compiler speedup. Compiler (`gcc`/`g++`) is a container prerequisite for `torch.compile`; apt-installed tools may disappear on pod recreation.
 
-> What this run is really for: **the 125M↔1.3B gap on identical code and hardware is the
-> arithmetic-intensity argument shown directly**, and the eager↔compiled delta measures how much of
-> the loss is elementwise/launch overhead. Two clean deltas beat one MFU number.
+### RUN M1-001…005 — single-B200 MFU: 125M vs 1.3B, eager vs `torch.compile` + attention ablation
+
+- **Prediction recorded:** 2026-10-31, **before any measured 125M/1.3B runs**. These are hypotheses, not observations. Adjust only *before* seeing relevant benchmark throughput and record the reason.
+- **Date / HW:** measured date TBD · **1×B200** · BF16 autocast · vocab 50304 · fused AdamW · block 1024 · synthetic on-device batches (no input pipeline).
+- **Precommitted benchmark protocol:** `--micro-bs 16 --grad-accum 1 --steps 200 --bench-warmup 50 --log-every 10 --seed 1337`, identical for both model sizes unless the 1.3B configuration fails to fit. Eager and compiled use `--backend flash` in M1-001…004; M1-005 changes *only* backend to `cudnn` versus M1-004. Log exceptions before reviewing throughput results.
+- **Question:** how much of one B200 does a 125M model use vs a 1.3B model? How much of the eager→compiled gain comes from reducing non-matmul / launch overhead? Which attention backend wins at 1.3B?
+- **PREDICTIONS (all pre-benchmark):**
+  - **M1-001 — 125M eager / Flash:** **5% MFU (~132,000 tok/s)**. Narrow 768-wide layers and relatively short operations likely leave the fast B200 underutilized, especially outside matmuls.
+  - **M1-002 — 125M compiled / Flash:** **8% MFU (~211,000 tok/s; +60% vs eager)**. Fusion and fewer Python/kernel-launch boundaries should have larger relative effect at small model width; magnitude is deliberately falsifiable.
+  - **M1-003 — 1.3B eager / Flash:** **15% MFU (~40,000 tok/s)**. Wider 2048-dimensional matmuls should use tensor cores more efficiently, increasing MFU despite a lower token rate.
+  - **M1-004 — 1.3B compiled / Flash:** **20% MFU (~53,000 tok/s; +33% vs eager)**. Fusion still helps, but large matrix compute already dominates more of each training step.
+  - **M1-005 — 1.3B compiled / cuDNN vs Flash:** **cuDNN ~5% faster** (~56,000 vs ~53,000 tok/s), hypothesis with low confidence. Shape-specialized cuDNN SDPA may be advantageous at head_dim=128, but Flash could win; verified profiler kernel identities are required for both runs.
+- **Arithmetic / denominator:** `peak=2.25e15` dense BF16 FLOP/s per B200; `model_configs.py` gives ~0.855G FLOPs/token for 125M and ~8.47G FLOPs/token for 1.3B. Therefore `tok/s = (MFU / 100) × 2.25e15 / FLOPs_per_token`. Same-batch-size design reduces one confound across model sizes; any MFU difference can still include kernel shape / launch effects, not just parameter count.
+- **Actual:** _fill after the measured runs; include tok/s, MFU, peak GB and backend kernels for each run_
+- **Gap vs prediction:** _fill after measured runs; investigate deviations, especially >20%_
+- **Artifacts:** `runs/M1-001.json` … `runs/M1-005.json` (produced by `train.py` for measured runs only)
+
+> Interpretation rule: 125M↔1.3B compares model sizes on the same hardware and batch size;
+> eager↔compiled compares execution modes at a fixed size and attention backend; M1-004↔005
+> isolates the SDPA backend. The tiny smoke runs above answer none of these three causal questions.
 
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
@@ -277,6 +287,25 @@ that's the field that makes it a story.
   not error. Always confirm the chosen transport in the debug output rather than assuming the
   hardware in `nvidia-smi topo -m` is the hardware being used.
 
+### ISSUE-003 — Two broken tests in the first model.py suite, caught by external review before first run
+
+- **Date / cost:** 2026-10-16 · 0 min of compute (caught in review, before any run)
+- **Symptom (would have been):** (a) `test_can_overfit_a_single_batch` raising
+  `view size is not compatible with input tensor's size and stride`; (b) `test_initial_loss_is_near_uniform`
+  failing at loss ≈ 10.32 vs the 10.83 uniform baseline.
+- **Root cause (a):** `targets.view(-1)` on `idx[:, 1:]` — shape (4, 31), strides (32, 1). Flattening
+  via `view` needs `stride[0] == size[1]·stride[1]`; 32 ≠ 31. Fix: `reshape`.
+- **Root cause (b):** the test scored the *inputs* as targets. With tied embeddings the true-token logit
+  is ≈ |wte[t]|² / std(residual) ≈ 0.02·C/√2 — **a copy bias that grows linearly with width**
+  (~0.9 at C=64, ~11 at C=768). The test was measuring that, not init quality. Fix: next-token targets;
+  added a separate test that asserts the copy bias exists, documenting it instead of just dodging it.
+- **Also changed:** GPU backend test now measures a bf16 *precision floor* (bf16 math vs fp32 math) and
+  asserts each fused backend's error ≤ 2× floor, instead of a guessed absolute tolerance.
+- **Generalizable lessons:** tests sliced from training-style data need the same non-contiguous inputs
+  real training produces; and a test threshold derived by reasoning is a hypothesis — I'd flagged these
+  two tests as "most likely to need calibration," which was the right suspicion for the wrong reason.
+  Interview-usable: *tied embeddings give an untrained model a structural prior toward copying its input.*
+
 ---
 
 ## 4. Decision Log
@@ -293,6 +322,23 @@ Non-obvious choices only. If the alternative was never plausible, don't log it.
 - **Because:** __
 - **What would change my mind:** __
 ```
+
+### DEC-008 — How train.py measures: windowed sync, separate compile time, observed kernels
+
+- **Date:** 2026-10-16
+- **Chose:** (1) sync once per `--log-every` window, never per step; (2) `--bench-warmup` steps trained
+  but never counted; (3) step 0 timed alone and recorded as `compile_s`; (4) one profiled fwd+bwd after
+  step 0 records which attention ops/kernels *actually* ran; (5) the RunRecord is built *before*
+  training so missing-prediction / dirty-tree guards fire in second one, not after the run.
+- **Over:** bench's per-step `step_end()` sync (still available, now unused by train.py)
+- **Because:** a per-step sync stops the CPU from queuing step N+1 while step N runs. On short steps
+  (125M on B200) that's a measurement artifact of plausibly a few percent — the meter measuring itself.
+  `sdpa_kernel()` restricts which backends are *allowed*; it doesn't prove which one *executed*
+  (compile, shape limits, unsupported cases can still change it) — so the record stores the aten op
+  name, e.g. `aten::_scaled_dot_product_cudnn_attention`, as ground truth.
+- **Cheap M7 side-experiment this enables:** per-step vs windowed sync at 125M quantifies the artifact.
+- **What would change my mind:** if windows hide step-time variance worth seeing (stragglers at M3) —
+  then add a per-step mode for diagnostics only, never for headline numbers.
 
 ### DEC-005 — Everything on 4×B200; A100 dropped as the dev rig (supersedes DEC-002)
 
@@ -457,10 +503,12 @@ _(no entries yet — but expect M4 to produce one)_
 
 ## 6. Interview pitch — fill in as numbers land
 
+_Future pitch template only; do not present these milestones as completed until measured._
+
 > "Beyond my applied LLM work I pretrained GPT models from scratch on a 4×NVLinked node — built
 > the data pipeline myself, then implemented DDP, FSDP across ZeRO stages, and 2-way tensor
 > parallelism, measuring the memory-vs-communication tradeoff directly. I took training MFU from
-> __% to __% by fixing __, and I have an fp8-vs-bf16 throughput result on Hopper."
+> __% to __% by fixing __, and I have an fp8-vs-bf16 throughput result on Blackwell."
 
 | Question | Answer (fill as measured) |
 |---|---|
