@@ -51,6 +51,23 @@ The original five-run protocol fixed micro-batch 16 to isolate model-size/compil
 
 **Measured tradeoff:** batch 16→128 increased throughput by **12.75%** while peak allocated memory increased from **12.3 to 85.6 GB (6.96×)**. The incremental token-throughput benefit shrank with each batch doubling, even as memory rose steeply. The batch-16 repeat M1-006 reproduced M1-002 throughput to **+0.21%**. Batch 16 is therefore a reasonable **memory-efficient starting point** for M3; batch 32 may be considered if a small per-GPU speed improvement is worth the extra memory. These runs alone do not establish the best setting for fixed global batch size, model quality, power efficiency, or other models.
 
+### Post-hoc two-parameter batch-scaling fit (M1-006…009)
+
+The four measured *mean* step times (computed as `tokens_per_step / cumulative_tokens_per_second`, rather than the reported window-mean p50) admit the following ordinary least-squares model:
+
+`mean_step_time ≈ 3.463 ms + 1.266 µs × tokens_per_step`
+
+| Micro-batch | Measured mean step | Fitted mean step | Relative fit error |
+|---:|---:|---:|---:|
+| 16 | 23.86 ms | 24.20 ms | +1.45% |
+| 32 | 45.26 ms | 44.95 ms | -0.70% |
+| 64 | 86.56 ms | 86.43 ms | -0.15% |
+| 128 | 169.29 ms | 169.39 ms | +0.06% |
+
+The maximum absolute relative residual is **1.45%**. In this *empirical model*, the non-amortizing intercept is about **14.5%** of the observed batch-16 step. Taking batch size to infinity *within the fitted relationship* gives an asymptotic throughput of **≈790K tok/s** (≈**30.0% reported MFU**); batch 16 already delivers **≈87%** of that extrapolated limit. Only ≈**3.9 MFU percentage points** could be recovered from compiled 125M batch-16 performance by eliminating this model's amortizable fixed cost. This is smaller than the **13.74-point** observed difference versus compiled 1.3B / Flash at batch 16 (26.11% versus 39.85%). The remaining ≈**9.8 points** are *not explained by this particular 125M batch-overhead model*; they are **not a measured per-operator or model-width attribution**.
+
+**Scope and next test:** this is a **post-hoc four-point fit**, not a preregistered prediction or a universal 30% GPU limit. Kernel schedules, per-token cost and memory pressure may change outside batches 16–128; the tiny residual on the same four fitted observations is not an independent validation. At M7, profile the fitted **≈3.46 ms/step intercept** (fused AdamW, enabled gradient clipping, gradient clearing, launch/host gaps are *candidate* contributors) and **≈1.266 µs/token slope** (GEMMs, attention, normalization, output projection and memory traffic). A fitted intercept is an accounting term, *not* a direct timing of those operations. For M3, repeat batch selection after measuring 4×B200 NCCL overhead rather than assuming that the one-GPU fit carries over to DDP.
+
 **Interpretation, not established mechanism:** already at batch 16, MLP GEMMs operate on M=16,384 token rows (for example `[16,384×768] @ [768×3072]`), so the simplistic prior that 125M must have single-digit MFU because of its narrow layers was false. Larger micro-batches increase the M dimension, but operator-level profiling is still needed to distinguish matmul efficiency, launch overhead, memory bandwidth, and optimizer contribution. Cumulative throughput declined modestly over some 64/128 runs; no GPU clock/power/temperature traces were collected to diagnose the drift.
 
 ### Predictions and calibration
