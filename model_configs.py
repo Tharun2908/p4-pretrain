@@ -68,6 +68,13 @@ MODELS: dict[str, GPTConfig] = {
 }
 
 
+# Not experiment models: for CPU smoke tests of train.py on the laptop. Kept out of MODELS
+# so they never appear in result tables or the param-count test sweep.
+DEBUG_MODELS: dict[str, GPTConfig] = {
+    "gpt-tiny": GPTConfig("gpt-tiny", n_layer=2, n_head=4, n_embd=64, block_size=64),
+}
+
+
 if __name__ == "__main__":
     hdr = f"{'model':<10} {'params':>8} {'hd':>4} {'GFLOP/tok':>10} {'attn %':>7} {'DDP static GB':>14} {'Chinchilla tok':>15}"
     print(hdr)

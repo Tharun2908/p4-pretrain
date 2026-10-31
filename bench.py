@@ -128,10 +128,16 @@ def gpt_flops_per_token(n_params_non_embed: int, n_layer: int, n_head: int,
         flops_per_token = 6*N + 12*L*H*Q*T
 
     6*N   : fwd(2) + bwd(4) matmul FLOPs per parameter.
-    12*L*H*Q*T : the attention score/value matmuls, which scale with sequence length
-                 and are *not* captured by parameter count. Dropping this term
-                 inflates MFU at long context — a common way people quietly
-                 overstate their numbers. Keep it.
+    12*L*H*Q*T : the attention score/value matmuls (q·kᵀ and att·v), which scale with
+                 sequence length and are *not* captured by parameter count. Dropping
+                 this positive term would UNDERSTATE MFU. (An earlier version of this
+                 comment said "inflates" — backwards; caught in review, ISSUE-004.)
+
+    Known bias of this convention, kept for comparability with PaLM/nanoGPT: the term
+    assumes FULL T×T attention, but causal flash/cuDNN kernels skip the masked upper
+    triangle and do roughly half that work. So MFU is credited with attention FLOPs that
+    never execute — an OVERstatement of up to ~attention_share/2 (≈7% at 125M, ≈4% at 1.3B,
+    from model_configs.py). Say this before an interviewer does.
 
     n_params_non_embed: exclude token+position embeddings (they're a lookup, not a matmul).
     """
@@ -168,7 +174,9 @@ class ThroughputMeter:
         self.tokens = 0
         self.elapsed = 0.0
         self.losses: list[float] = []
-        self.step_times: list[float] = []
+        self.step_times: list[float] = []   # per step (step mode) or per-window mean (window mode)
+        self.timing_mode = "per-step"
+        self._window_steps = 0
         self._t0 = None
         if torch is not None and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -196,7 +204,9 @@ class ThroughputMeter:
         return self.tokens / self.elapsed if self.elapsed > 0 else 0.0
 
     @property
-    def mfu(self) -> float:
+    def mfu(self) -> float | None:
+        if self.peak_flops <= 0:                     # CPU / unknown hardware
+            return None
         return (self.tokens_per_sec * self.flops_per_token) / self.peak_flops
 
     @property
@@ -215,9 +225,29 @@ class ThroughputMeter:
         s = sorted(self.step_times)
         return s[int(len(s) * 0.95)] if s else 0.0
 
+    def record_window(self, tokens: int, n_steps: int, dt: float,
+                      loss: float | None = None) -> None:
+        """
+        Windowed timing: caller syncs ONCE per window of n_steps and reports the total.
+
+        Why: step_end() syncs every step, which stops the CPU from queuing step N+1's kernels
+        while step N runs. On small, fast steps (125M on a B200) that lost overlap is a
+        measurement artifact of a few percent — the meter would be measuring itself. The
+        caller is responsible for discarding warmup windows (this method doesn't).
+        p50/p95 become percentiles over per-window mean step times.
+        """
+        self.timing_mode = "windowed"
+        self.n_steps += n_steps
+        self._window_steps += n_steps
+        self.tokens += tokens
+        self.elapsed += dt
+        self.step_times.append(dt / n_steps)
+        if loss is not None:
+            self.losses.append(float(loss))
+
     def report(self) -> str:
         return (f"step {self.n_steps:>6} | {self.tokens_per_sec:>9,.0f} tok/s | "
-                f"MFU {self.mfu*100:5.2f}% | peak {self.peak_mem_gb:5.1f} GB | "
+                f"MFU {(f'{self.mfu*100:5.2f}%') if self.mfu is not None else '  n/a '} | peak {self.peak_mem_gb:5.1f} GB | "
                 f"p50 {self.step_time_p50*1e3:6.1f} ms | p95 {self.step_time_p95*1e3:6.1f} ms"
                 + (f" | loss {self.losses[-1]:.4f}" if self.losses else ""))
 
@@ -225,15 +255,17 @@ class ThroughputMeter:
         return {
             "tokens_per_sec": round(self.tokens_per_sec, 1),
             "tokens_per_sec_per_gpu": round(self.tokens_per_sec / self.world_size, 1),
-            "mfu": round(self.mfu, 5),
+            "mfu": round(self.mfu, 5) if self.mfu is not None else None,
             "mfu_denominator_per_gpu": self.peak_flops_per_gpu,
             "mfu_denominator_label": self.peak_label,
             "flops_per_token": self.flops_per_token,
             "peak_mem_gb": round(self.peak_mem_gb, 3),
             "step_time_p50_ms": round(self.step_time_p50 * 1e3, 3),
             "step_time_p95_ms": round(self.step_time_p95 * 1e3, 3),
-            "measured_steps": max(0, self.n_steps - self.warmup),
+            "measured_steps": (self._window_steps if self.timing_mode == "windowed"
+                               else max(0, self.n_steps - self.warmup)),
             "warmup_steps_discarded": self.warmup,
+            "timing_mode": self.timing_mode,
             "final_loss": self.losses[-1] if self.losses else None,
             "min_loss": min(self.losses) if self.losses else None,
         }
@@ -322,12 +354,15 @@ class RunRecord:
             )
 
     def finish(self, meter: ThroughputMeter | None = None, notes: str = "",
-               outcome: str = "", outdir: str = "runs") -> Path | None:
+               outcome: str = "", outdir: str = "runs",
+               extra: dict[str, Any] | None = None) -> Path | None:
         rank = int(os.environ.get("RANK", "0"))
         if rank != 0:
             return None                                  # only rank 0 writes
         if meter is not None:
             self.metrics = meter.as_dict()
+        if extra:
+            self.metrics.update(extra)          # e.g. compile_s, observed attention kernels
         self.notes = notes or self.notes
         self.outcome = outcome or self.outcome
         self.metrics["wall_clock_s"] = round(
@@ -362,7 +397,7 @@ def summarize(runs_dir: str) -> str:
             "gpus": c.get("world_size", 1),
             "tok/s": f'{m.get("tokens_per_sec", 0):,.0f}',
             "tok/s/gpu": f'{m.get("tokens_per_sec_per_gpu", 0):,.0f}',
-            "MFU %": f'{m.get("mfu", 0)*100:.2f}',
+            "MFU %": f'{m["mfu"]*100:.2f}' if m.get("mfu") is not None else "—",
             "MFU denom": (m.get("mfu_denominator_label") or "—").split(" = ")[0],
             "peak GB": f'{m.get("peak_mem_gb", 0):.1f}',
             "p50 ms": f'{m.get("step_time_p50_ms", 0):.1f}',
