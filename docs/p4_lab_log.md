@@ -2,7 +2,7 @@
 
 **Started:** 2026-08-01
 **Repo:** `/workspace/p4/p4-pretrain/`
-**Rule:** nothing gets measured twice. If it isn't in this file, it didn't happen.
+**Rule:** no unmotivated repeat measurements; documented reproducibility checks are experiments. If it isn't in this file, it didn't happen.
 
 ---
 
@@ -55,7 +55,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M# | Label | GPUs | Status | Blocking |
 |----|-------|------|--------|----------|
 | M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ✅ 1×B200 env verified · ⬜ 4×B200 NCCL rerun | 4-GPU session |
-| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; tiny CUDA smokes; five measured B200 baselines complete | — |
+| M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
 | M2 | Data pipeline (tokenize→dedup→filter→pack→shard) | **0** (CPU) | ⬜ not started | — |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ⬜ not started | M1, M2 |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
@@ -185,6 +185,7 @@ transferring at three-quarters of achievable bandwidth.
 - **Prediction recorded:** 2026-10-31, **before the first measured 125M/1.3B run**. Original hypotheses remain unchanged below. Subsequent *revised* expectations were recorded in the respective run's `--prediction` string after earlier results were known; they are marked as conditional updates and are not substituted for the original priors.
 - **Hardware / precision:** 1× B200, `cl-worker36`, BF16 autocast; dense BF16 peak denominator = 2.25e15 FLOP/s; GPT-125M ≈ 0.855G estimated training FLOPs/token, GPT-1.3B ≈ 8.47G.
 - **Controlled protocol:** `--micro-bs 16 --grad-accum 1 --steps 200 --bench-warmup 50 --log-every 10`, sequence length 1024, synthetic on-device batches (16,384 tokens/optimizer step), fused AdamW, 150 measured steps; eager/compiled pairs explicitly use Flash. M1-005 changes *only* the attention backend to cuDNN relative to M1-004. Each run profiles observed fused attention operations.
+- **MFU accounting caveat:** `bench.py` uses the PaLM/nanoGPT convention `6N + 12LHQT` FLOPs/token, including a full `T×T` attention term. Fused **causal** Flash/cuDNN attention can skip much of the masked upper triangle, so this convention *overcredits* attention FLOPs (roughly half of the attention term, subject to block/tile effects). The reported MFUs are **not** causal-adjusted and are kept for published-convention comparability; the heuristic relative overcount is ~6.5–7% at 125M and ~3.5–4% at 1.3B. These estimates do not establish executed FLOPs. See reconstructed ISSUE-005.
 - **Original pre-benchmark predictions:**
   - **M1-001, 125M eager/Flash:** 5% MFU, ≈132K tok/s; anticipated poor utilization from narrower layers and overhead.
   - **M1-002, 125M compiled/Flash:** 8% MFU, ≈211K tok/s, ≈+60% throughput over eager; expected kernel fusion to help a small model.
@@ -253,14 +254,71 @@ transferring at three-quarters of achievable bandwidth.
 - **Backend evidence:** profiler saw `aten::_scaled_dot_product_cudnn_attention` and backward; kernel names included `cudnn_generated_...sm100...`.
 - **Artifact:** `runs/M1-005.json`.
 
+### M1-006…009 — GPT-125M micro-batch sweep (predictions registered before runs)
+
+- **Date / HW / stack:** 2026-10-31 · 1×B200 (`cl-worker36`), driver 580.196.07, torch 2.8.0+cu128, BF16; GPT-125M compiled with observed **Flash forward and backward** throughout.
+- **Question:** at fixed model, context length and execution backend, how much throughput can a larger per-GPU micro-batch recover, and how much activation memory does it cost?
+- **Protocol:** micro_bs ∈ {16, 32, 64, 128}; `grad_accum=1`, sequence length 1024, 200 post-initial optimizer steps (50 unmeasured warmup + 150 measured; separate step 0 includes compilation), `--log-every 10`, fused AdamW, reused synthetic on-device batches. `run_train.sh` selected the Flash-only persistent Inductor cache **before** Python startup; actual kernels were profiler-verified. The batch size *is the experimental variable*, so the effective optimizer batch also changes; the results address systems throughput, **not** equal-effective-batch convergence.
+- **Original sweep predictions (kept unchanged after seeing results):** M1-006 = **685K tok/s, 26% MFU** (reproduction of M1-002); M1-007 = **850K, 32%**; M1-008 = **1.0M, 38%**; M1-009 = **1.1M, 42%**. Rationale: larger matrix-multiply `M = micro_bs × 1024` could improve utilization, but scaling should eventually flatten. The extrapolations were uncertain.
+- **Conditional revisions, made only after earlier run results:** after M1-007, before M1-008, **750K–800K tok/s**; after M1-008, before M1-009, **775K–800K tok/s**. Revisions are not substituted for original predictions.
+
+| Run | Micro-bs | Tokens/step | Original prediction tok/s / MFU | Actual tok/s | MFU* | Window-mean p50 | Peak allocated | Gain vs previous |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| M1-006 | 16 | 16,384 | 685,000 / 26% | **686,697** | **26.11%** | 23.9 ms | 12.3 GB | — |
+| M1-007 | 32 | 32,768 | 850,000 / 32% | **723,974** | **27.52%** | 45.2 ms | 22.8 GB | +5.43% |
+| M1-008 | 64 | 65,536 | 1,000,000 / 38% | **757,145** | **28.78%** | 86.6 ms | 43.7 GB | +4.58% |
+| M1-009 | 128 | 131,072 | 1,100,000 / 42% | **774,236** | **29.43%** | 169.5 ms | 85.6 GB | +2.26% |
+
+*MFU follows the unchanged full-attention PaLM/nanoGPT convention; see caveat above. Throughput is the final cumulative report across 150 measured steps, not an instantaneous endpoint sample. Step p50 is calculated from 10-step window-average times.*
+
+### RUN M1-006 — Reproduce compiled GPT-125M / Flash baseline at batch 16
+
+- **PREDICTION (before run):** ≈685,000 tok/s, ≈26% MFU, anchored to M1-002.
+- **Actual:** **686,697 tok/s**, **26.11% MFU**, 23.9 ms p50, 12.3 GB peak allocated, 150 measured steps, Flash fwd/bwd verified.
+- **Gap vs prediction:** **+0.25% tok/s** versus 685K; **+0.11 percentage points MFU** versus 26%. Relative to M1-002 (685,273 tok/s), the repeat was **+0.21%** with matching reported p50 and memory. This supports close repeatability across these two runs, not a statistical confidence interval.
+- **Artifact:** `runs/M1-006.json`.
+
+### RUN M1-007 — Increase GPT-125M micro-batch from 16 to 32
+
+- **PREDICTION (before run):** ≈850,000 tok/s, 32% MFU; larger token-axis matrix dimensions would improve utilization.
+- **Actual:** **723,974 tok/s**, **27.52% MFU**, 45.2 ms p50, 22.8 GB peak allocated, 150 measured steps, Flash fwd/bwd verified.
+- **Gap vs original prediction:** throughput **−14.83%** relative to predicted 850K, MFU **−4.48 percentage points**. Compared with M1-006, **+5.43% throughput** for **+10.5 GB** peak allocated memory; the per-step token count doubled.
+- **Interpretation:** batch 16 already presented substantial matmul `M = 16,384`; scaling improved throughput only modestly. Exact kernel bottleneck remains unprofiled.
+- **Artifact:** `runs/M1-007.json`.
+
+### RUN M1-008 — Increase GPT-125M micro-batch from 32 to 64
+
+- **PREDICTION (original, before sweep):** ≈1,000,000 tok/s, 38% MFU. **Conditional revision before this run:** ≈750K–800K tok/s, after observing M1-007.
+- **Actual:** **757,145 tok/s**, **28.78% MFU**, 86.6 ms p50, 43.7 GB peak allocated, 150 measured steps, Flash fwd/bwd verified.
+- **Gap vs original prediction:** throughput **−24.29%**, MFU **−9.22 percentage points**. The observed result fell within the revised throughput band. Compared with M1-007: **+4.58% throughput** at **+20.9 GB** peak allocated memory.
+- **Observation:** cumulative throughput gradually moved from ~768.4K early to 757.1K tok/s by the end of the measured run; GPU clocks, temperature and power were not logged, so the cause remains unknown.
+- **Artifact:** `runs/M1-008.json`.
+
+### RUN M1-009 — Increase GPT-125M micro-batch from 64 to 128
+
+- **PREDICTION (original, before sweep):** ≈1,100,000 tok/s, 42% MFU. **Conditional revision before this run:** ≈775K–800K tok/s, after observing M1-008.
+- **Actual:** **774,236 tok/s**, **29.43% MFU**, 169.5 ms p50, 85.6 GB peak allocated, 150 measured steps, Flash fwd/bwd verified.
+- **Gap vs original prediction:** throughput **−29.61%**, MFU **−12.57 percentage points**. Final throughput was **764 tok/s (0.10%) below** the revised range's lower bound. Compared with M1-008: **+2.26% throughput** at **+41.9 GB** peak allocated memory.
+- **Observation:** cumulative throughput declined from ~789.3K early to ~774.2K by the end; no thermal, clock or power data was gathered, so do not assign a cause.
+- **Artifact:** `runs/M1-009.json`.
+
+### Batch-sweep finding and implication for M3
+
+- **Observed:** batch 16→128 (8× tokens per optimizer step) increased steady-state tok/s **+12.75%** (686,697→774,236) while **peak allocated memory rose 6.96×** (12.3→85.6 GB). Incremental throughput gains narrowed **+5.43% → +4.58% → +2.26%** as batch doubled. The fixed-batch M1-002/M1-004 model-size comparison remains controlled, but does **not** identify each model's maximum attainable MFU.
+- **Structural explanation, stated as hypothesis:** at batch 16, a GPT-125M MLP multiply already has shapes **[16,384×768] × [768×3,072]** (`M=16,384`, `K=768`, `N=3072`), providing meaningful parallel work. Larger M increases work but need not improve kernel efficiency much once launch/matmul utilization is reasonably good. This experiment alone does not diagnose whether the remaining gap is compute, memory traffic, optimizer, or other overhead; defer causal attribution to M7.
+- **M3 decision:** use micro_bs=16 as a memory-efficient starting point (rather than treating it as the proven optimal throughput setting); compare micro_bs=32 if useful for per-GPU throughput. For a *fixed global batch*, micro-batch and gradient accumulation must be adjusted jointly, so this sweep must not be presented as an optimization-quality comparison.
+- **Reproducibility note:** backend-specific Inductor caches, compiler check in `setup_env.sh` and the `run_train.sh` launcher were verified on 1×B200. Compiled `gpt-tiny` Flash and cuDNN smoke tests each executed the requested fwd/bwd kernels; these 10-step diagnostics are not benchmark results. M1-006 independently reproduced M1-002 throughput within 0.21%.
+
 ### M1 synthesis — supported findings, caveats, and next action
 
 - **Model-size effect:** Eager MFU rose **17.54% → 34.30%** when switching from 125M to 1.3B with the same batch/sequence configuration, while tok/s fell **461.5K → 91.1K**. This is a fixed-configuration observation, not a universal law that larger models yield higher MFU.
 - **Compiler effect:** at fixed size and Flash backend, `torch.compile` improved steady-state throughput **1.485× at 125M** versus **1.162× at 1.3B**; peak allocated memory fell **28.5%** and **8.2%**, respectively. Root causes require per-op profiling later in M7.
 - **Backend effect:** cuDNN beat Flash by **7.41%** at compiled GPT-1.3B (head_dim 128, sequence length 1024). This result does not generalize to other shapes or PyTorch/cuDNN versions without testing.
-- **Measurement limits:** one full measured run per configuration; no across-run error bars; 150 measured optimizer steps per run, 10-step averaged windows, hardware vendor theoretical BF16 peak as MFU denominator; on-device **repeated synthetic** batches remove input pipeline costs and do not assess language-model quality. `torch.cuda.max_memory_allocated()` reports allocated memory, not reserved/system-wide usage. A full tokenized real-data loss curve remains a separate M2+ deliverable.
+- **Batch-size effect:** GPT-125M compiled / Flash batch 16→128 gained **+12.75% throughput** at **6.96×** peak allocated memory; gains diminished with each doubling. See M1-006…009; effective optimizer batch changed, so this is a systems throughput comparison only.
+- **MFU disclosure:** all reported numbers retain the full-attention FLOPs convention. Causal fused attention credits masked work as if executed, so the absolute MFU is overestimated by approximately half the attention share (≈6.5–7% *relative* at 125M and ≈3.5–4% at 1.3B). No profiler-derived executed-FLOP correction is claimed.
+- **Measurement limits:** one full measured run per configuration except the 125M compiled batch-16 baseline, which was repeated as M1-006; no across-run error bars; 150 measured optimizer steps per run, 10-step averaged windows, hardware vendor theoretical BF16 peak as MFU denominator; on-device **repeated synthetic** batches remove input pipeline costs and do not assess language-model quality. `torch.cuda.max_memory_allocated()` reports allocated memory, not reserved/system-wide usage. A full tokenized real-data loss curve remains a separate M2+ deliverable.
 - **Reproducibility:** original predictions were preserved. Successful runs verified the *executed* attention backend, not only the requested flag. First-step timings include first touch/autotuning and potentially cached compilation; don't treat them as pure compile latency.
-- **Close M1:** preserve five JSON artifacts and documentation in Git; defer detailed bottleneck attribution and repeated confidence intervals to M7. **Next: M2 CPU data pipeline** (tokenize, dedup, quality-filter, pack, shard); release the 1-GPU pod once artifacts are committed.
+- **Close M1:** preserve **nine** JSON artifacts (M1-001…009), the original prediction record, updated documentation, compiler-cache launcher and native-compiler setup in Git; defer detailed bottleneck attribution and repeated confidence intervals to M7. **Next: M2 CPU data pipeline** (tokenize, dedup, quality-filter, pack, shard); release the 1-GPU pod once artifacts are verified/committed.
 
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
@@ -373,10 +431,19 @@ that's the field that makes it a story.
 - **Symptom (exact):** M1-005 started with `--compile --backend cudnn`, but the profiler recorded `aten::_scaled_dot_product_flash_attention` and Flash backward; `verify_backend` raised `RuntimeError: requested backend 'cudnn' not confirmed by the profiler` *before* any measured window. That failed attempt is not a valid cuDNN benchmark.
 - **Observations:** Previous run M1-004 compiled the same GPT-1.3B graph with Flash; failing M1-005 first step took ~3.1s versus 23.2s on earlier compiled Flash run. A diagnostic after isolating Inductor cache took ~21.7s on first step and showed cuDNN operations. Full isolated-cache run completed and verified cuDNN, yielding 113,663 tok/s.
 - **Leading hypothesis (not fully proven):** Inductor graph/cache reuse failed to reflect the requested SDPA backend when the model shape remained the same. A short first step and the resolution with cache isolation are consistent with stale compiled graph reuse; they are not by themselves proof of the exact upstream cache-key defect.
-- **Fix / mitigation:** use an isolated `TORCHINDUCTOR_CACHE_DIR` for each compiled backend (e.g. `/workspace/.cache/p4-inductor/m1-005-cudnn`); keep `verify_backend` as a hard failure for measured runs; never rename a Flash run as cuDNN.
+- **Fix / mitigation:** use an isolated `TORCHINDUCTOR_CACHE_DIR` for each compiled backend (e.g. `/workspace/.cache/p4-inductor/cudnn` or `/flash`); `run_train.sh` now sets that environment variable **before Python starts**, and `setup_env.sh` configures the persistent cache root and checks native compilers on GPU pods. The Flash→cuDNN separation was smoke-validated on compiled `gpt-tiny`, with profiler-confirmed forward/backward in both cases; the exact failing 1.3B warm-cache sequence was not rerun after the launcher change. Keep `verify_backend` as a hard failure for measured runs; never rename a Flash run as cuDNN.
 - **Generalizable lesson:** a configuration flag expresses intent; the profiler reveals what executed. In systems experiments, guard the validity of the independent variable **before** collecting headline metrics.
-- **Follow-up (optional):** reproduce the mismatch with fresh and warm caches under identical code, inspect compile cache key behavior and backend versions; fix permanently in setup/runtime or upgrade after controlled validation. Not needed to close M1.
+- **Follow-up (optional):** isolate the precise cache layer with a minimal same-directory backend-switch repro and compare against a newer PyTorch version, if useful; the local cache isolation and profiler guard are sufficient for M1. Not needed to close M1.
 
+
+### ISSUE-005 — train.py / bench.py review corrected attention-FLOPs interpretation (reconstructed)
+
+- **Provenance:** reconstructed on 2026-10-31 from the uploaded `bench.py` docstring and M1 review notes. The original review-round log entry was lost when ISSUE-004 was reused for the compiled-backend cache failure. **This is not a verbatim recovery of the missing entry**; precise review date, time cost and any other findings are not available in the uploaded sources.
+- **Symptom:** two different questions about the `12 × L × H × Q × T` attention term were conflated: (a) should a FLOPs estimate include attention score/value matmuls beyond the parameter-count `6N` term? **Yes.** (b) does the conventional full-matrix estimate accurately count executed FLOPs for causal fused attention? **Not exactly.**
+- **Review finding:** omitting the attention term entirely **understates** the conventional estimate, whereas counting the entire `T×T` matrix for causal attention can **overstate actual masked-kernel work**. The earlier comment in `bench.py` had reversed the first point (called it an inflation); the corrected source now distinguishes the two.
+- **Correction:** retain the PaLM/nanoGPT formula for comparability, clearly document its causal-attention upper-triangle overcount and avoid portraying convention-based MFU as profiler-derived executed FLOPs. Approximate relative bias: ~6.5–7% for GPT-125M and ~3.5–4% for GPT-1.3B under a half-attention-term heuristic; kernel tile details make these *estimates*, not exact corrections.
+- **Generalizable lesson:** a model FLOPs formula is a reporting convention, not an instruction-level hardware counter. A term can be essential to the conventional estimator while still overcrediting work skipped by a specialized causal implementation. Review mathematical assumptions and source-code comments separately.
+- **Resolution:** documentation now discloses the limitation; the stale `ISSUE-004` code reference is updated to `ISSUE-005`, preserving ISSUE-004 for the separately verified backend-cache incident.
 
 ---
 
@@ -517,6 +584,7 @@ Non-obvious choices only. If the alternative was never plausible, don't log it.
     of the same asset.
 - **What would change my mind:** if the Blackwell software stack fights back (see §3). Fallback
   is the original H200 fp8-vs-bf16 two-point ablation, which is still a good result.
+- **Retrospective correction (2026-10-31, after M1):** the *single-digit MFU* claim was **falsified** on 1×B200: GPT-125M eager reached **17.54%**, compiled/Flash **26.05%**, and compiled batch-128 **29.43%** under the stated PaLM/nanoGPT convention. The original claim remains above as a historical prior; the newer evidence supersedes it. At batch 16 with 1024-token context, the token-axis matmul dimension is already **M=16,384**, e.g. MLP GEMM `[16,384×768] @ [768×3072]`. Reasoning solely from small model width ignored this substantial M dimension; the input batches were already on GPU, so the prediction of dataloader-bound measured steps was also inapplicable to M1. The observation does **not** establish the fraction of SM cycles doing useful work or a root-cause profile.
 - **Confirmed 2026-08-01:** the A100 pod runs torch 2.4.1+cu124 — correct for sm_80, but it has
   no `sm_100`, so **this image cannot be reused for the B200 runs.** M6 needs a separate
   CUDA 12.8+ image. Build and test it *before* holding a scarce B200 slot.
@@ -586,7 +654,7 @@ _Future pitch template only; do not present these milestones as completed until 
 |---|---|
 | Scaling efficiency at 4 GPUs? | DDP hit __× of ideal 4×; gap is all-reduce grad sync, held down by NVLink at __ GB/s busbw |
 | What did ZeRO-3 cost you? | −__% throughput for −__% peak memory; on a model that fits, DDP wins — FSDP is a big-model tool |
-| MFU story? | M1 single B200 GPT-125M eager 17.54% → compiled 26.05%; steady-state +48.5% tok/s; exact bottleneck attribution deferred to M7 |
+| MFU story? | M1 single B200 GPT-125M eager 17.54% → compiled 26.05% (+48.5% tok/s); batch 16→128 reached 29.43% but cost 6.96× peak allocated memory for +12.75% tok/s; MFU is convention-based and causal attention overcount is disclosed; root-cause profiling deferred to M7 |
 | Fault tolerance? | Checkpoint/resume survives a mid-run `kill -9`; tested by __ at step __, resumed to identical loss trajectory |
 | fp8? | __× throughput over bf16 at __ loss delta; watched range/overflow in __ |
 | Hardest bug? | ISSUE-004: requested cuDNN but compiler cache reused Flash; profiler guard caught backend mismatch |

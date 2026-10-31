@@ -12,8 +12,9 @@
 - **Optimization:** fused AdamW; BF16 autocast; native SDPA. `--compile` toggles `torch.compile`; SDPA backend pinned `flash` or `cudnn`; **profiled operation names verified** before accepting a measured run.
 - **Measurement:** CUDA synchronized once per 10-step timing window, excluding warmup and periodic logging; aggregate tokens/sec, model FLOPs utilization (MFU), and `torch.cuda.max_memory_allocated()`. p50/p95 are **percentiles of 10-step window-averaged times**. First-step times include compilation, initialization/autotuning and cache effects, not isolated compiler duration.
 - **MFU convention:** model training FLOPs/token ≈ `6 × non-embedding params + 12 × layers × heads × head_dim × sequence_length`; divide throughput × estimated FLOPs/token by **2.25e15 dense BF16 FLOP/s**. Approximate values: 0.855G FLOPs/token (125M), 8.47G (1.3B). This is *model FLOPs* over hardware peak, not the fraction of all SM cycles that perform useful compute.
+- **Known causal-attention overcount:** the conventional `12LHQT` attention term assumes full `T×T` attention. Fused **causal** Flash/cuDNN kernels can skip much of the masked upper triangle, so this MFU **overcredits** FLOPs that need not execute. A rough half-of-attention-term adjustment implies about **6.5–7% relative overstatement at GPT-125M and 3.5–4% at GPT-1.3B**, ignoring tile/diagonal implementation details. For example, the five reported MFUs would be approximately **16.4%, 24.3%, 33.1%, 38.4%, 41.3%** under that *heuristic*, **not** profiler-counted executed-FLOP estimates. Published-convention results below are intentionally **unchanged** for comparability; same-model, same-context throughput ratios are unaffected.
 
-### Five-run result table
+### Five-run controlled baseline table
 
 | Run | Model | Execution | Observed SDPA | Throughput (tok/s) | MFU | Step p50† | Peak allocated | First step‡ |
 |---|---|---|---|---:|---:|---:|---:|---:|
@@ -33,6 +34,25 @@
 | `torch.compile` at GPT-1.3B, Flash fixed | M1-003 | M1-004 | **+16.2% (1.162×)** | +5.55 percentage points | **−8.2%** |
 | cuDNN instead of Flash at compiled GPT-1.3B | M1-004 | M1-005 | **+7.41% (1.074×)** | +2.96 percentage points | 0.0% at reported precision |
 
+### M1-006…009 — Compiled GPT-125M micro-batch scaling
+
+The original five-run protocol fixed micro-batch 16 to isolate model-size/compiler/backend comparisons. A separate **batch-size sweep** tests whether the relatively low 125M MFU can be substantially improved just by providing more token rows to the GPU. Configuration remained 1×B200, GPT-125M, BF16, compiled Flash Attention (**fwd+bwd profiler-verified**), sequence length 1024, grad_accum 1, 200 post-initial steps (50 warmup + 150 measured; initial step 0 timed separately), repeated synthetic on-device batches. The batch size was varied; **effective global optimizer batch therefore varied too**, so these are systems-performance comparisons, not equal-batch training-quality experiments.
+
+| Run | Micro-batch | Tokens/step | Throughput (tok/s) | MFU* | Step p50† | Peak allocated | Gain over prior batch |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| M1-006 | 16 | 16,384 | **686,697** | **26.11%** | 23.9 ms | 12.3 GB | — |
+| M1-007 | 32 | 32,768 | **723,974** | **27.52%** | 45.2 ms | 22.8 GB | +5.43% |
+| M1-008 | 64 | 65,536 | **757,145** | **28.78%** | 86.6 ms | 43.7 GB | +4.58% |
+| M1-009 | 128 | 131,072 | **774,236** | **29.43%** | 169.5 ms | 85.6 GB | +2.26% |
+
+*Unadjusted conventional MFU (causal-attention overcount disclosed above). † p50 over ten-step **window mean** times, not individually instrumented steps. Throughput is cumulative over the 150 measured steps.*
+
+**Prediction calibration (original forecasts unchanged):** before the sweep, predictions for batches 16/32/64/128 were **685K/850K/1.0M/1.1M tok/s** and **26%/32%/38%/42% MFU**, respectively. M1-006 landed **+0.25%** relative to its 685K forecast; M1-007, M1-008, and M1-009 throughput came in **14.83%, 24.29%, and 29.61% below** their original forecasts. After M1-007, the expectation for M1-008 was revised to 750K–800K and was met. After M1-008, M1-009 was revised to 775K–800K and finished 764 tok/s below that range; none of those conditional revisions replaced the preregistered forecasts. Exact command/prediction wording is preserved in [`p4_lab_log.md`](p4_lab_log.md) and the run JSONs.
+
+**Measured tradeoff:** batch 16→128 increased throughput by **12.75%** while peak allocated memory increased from **12.3 to 85.6 GB (6.96×)**. The incremental token-throughput benefit shrank with each batch doubling, even as memory rose steeply. The batch-16 repeat M1-006 reproduced M1-002 throughput to **+0.21%**. Batch 16 is therefore a reasonable **memory-efficient starting point** for M3; batch 32 may be considered if a small per-GPU speed improvement is worth the extra memory. These runs alone do not establish the best setting for fixed global batch size, model quality, power efficiency, or other models.
+
+**Interpretation, not established mechanism:** already at batch 16, MLP GEMMs operate on M=16,384 token rows (for example `[16,384×768] @ [768×3072]`), so the simplistic prior that 125M must have single-digit MFU because of its narrow layers was false. Larger micro-batches increase the M dimension, but operator-level profiling is still needed to distinguish matmul efficiency, launch overhead, memory bandwidth, and optimizer contribution. Cumulative throughput declined modestly over some 64/128 runs; no GPU clock/power/temperature traces were collected to diagnose the drift.
+
 ### Predictions and calibration
 
 The preregistered predictions were **not retroactively edited**. Later conditional estimates were written before their associated runs using already-observed earlier M1 results; these are distinguished from original prior estimates in [`p4_lab_log.md`](p4_lab_log.md).
@@ -50,12 +70,12 @@ The preregistered predictions were **not retroactively edited**. Later condition
 1. **Model size:** with identical 16,384-token steps and BF16 precision, GPT-1.3B eager achieved 34.30% MFU versus GPT-125M eager's 17.54%. A larger share of large matmuls is a plausible explanation; operator-level profiling remains a future task. This does **not** imply 1.3B processes more tokens/sec.
 2. **Compilation:** compiled throughput rose by 48.5% at 125M, but only 16.2% at 1.3B. Peak allocated memory fell in both cases. Fusion and fewer launches are potential mechanisms; actual attribution requires M7 traces, not just end-to-end timings.
 3. **Attention backend:** at compiled GPT-1.3B (sequence length 1024, head_dim 128), cuDNN outperformed Flash by 7.41%. Neither result establishes which is best for other head dimensions, sequence lengths or library versions.
-4. **Backend-identity failure caught:** an initial M1-005 attempt requested cuDNN but executed Flash kernels and was **rejected** by `verify_backend`, rather than silently counted. A separate `TORCHINDUCTOR_CACHE_DIR` was associated with correct cuDNN dispatch in a diagnostic and full run. Incorrect cache reuse is a leading hypothesis, **not a conclusively isolated root cause**. See `ISSUE-004` in the lab log.
-5. **Statistical and scope limitations:** each configuration has a single official 150-measured-step run. Minor drift was observed in longer 1.3B runs; no cross-run confidence intervals or hardware clock/thermal trace. Loss values on repeated random synthetic batches do **not** validate generalization, data preparation or a realistic pretraining loss curve. No data-loader throughput, multi-GPU scaling, FSDP or tensor-parallel results are implied by M1.
+4. **Backend-identity failure caught:** an initial M1-005 attempt requested cuDNN but executed Flash kernels and was **rejected** by `verify_backend`, rather than silently counted. A separate `TORCHINDUCTOR_CACHE_DIR` was associated with correct cuDNN dispatch in a diagnostic and full run. Incorrect cache reuse is a leading hypothesis, **not a conclusively isolated local root cause**. The permanent `run_train.sh` launcher now isolates Inductor cache directories by requested SDPA backend before Python startup; subsequent compiled tiny Flash/cuDNN smoke runs both verified their actual fwd/bwd kernels. See `ISSUE-004` in the lab log.
+5. **Statistical and scope limitations:** each configuration has a single official 150-measured-step run, except the compiled GPT-125M batch-16 configuration, repeated as M1-006. Minor drift was observed in longer 1.3B runs and in batch-64/128 cumulative throughput; no cross-run confidence intervals or hardware clock/thermal trace. The causal-attention estimator issue is recorded separately as reconstructed `ISSUE-005`. Loss values on repeated random synthetic batches do **not** validate generalization, data preparation or a realistic pretraining loss curve. No data-loader throughput, multi-GPU scaling, FSDP or tensor-parallel results are implied by M1.
 
 ### Reproducing from saved artifacts
 
-Each measured run produced `runs/M1-00{1..5}.json`, containing the run configuration, environment information, predictions, observed attention operations, and metrics. Original commands and prediction rationale are preserved in [`p4_lab_log.md`](p4_lab_log.md).
+Each measured run produced `runs/M1-00{1..9}.json` (nine JSON artifacts), containing the run configuration, environment information, predictions, observed attention operations, and metrics. Original and conditional predictions and the experiment rationale are preserved in [`p4_lab_log.md`](p4_lab_log.md).
 
 ```bash
 source /workspace/p4/p4env.sh
@@ -63,7 +83,7 @@ python -m pytest -q -rs
 python bench.py --summarize runs/
 ```
 
-For future repetitions, set an **independent Inductor cache directory for each compiled attention backend** and verify the profiler output prior to accepting the result. `torch.compile` may require system C build tools in fresh containers.
+For future repetitions, use `bash run_train.sh ... --compile --backend flash` (or `cudnn`) to set a **separate Inductor cache directory before Python starts**; keep profiler backend verification enabled. `setup_env.sh` checks and, on supported root GPU pods, installs native compiler tools if absent, while preserving the locked Python environment on the PVC.
 
 ## Remaining milestones
 

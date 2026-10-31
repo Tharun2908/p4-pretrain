@@ -131,7 +131,7 @@ def gpt_flops_per_token(n_params_non_embed: int, n_layer: int, n_head: int,
     12*L*H*Q*T : the attention score/value matmuls (q·kᵀ and att·v), which scale with
                  sequence length and are *not* captured by parameter count. Dropping
                  this positive term would UNDERSTATE MFU. (An earlier version of this
-                 comment said "inflates" — backwards; caught in review, ISSUE-004.)
+                 comment said "inflates" — backwards; caught in review, ISSUE-005.)
 
     Known bias of this convention, kept for comparability with PaLM/nanoGPT: the term
     assumes FULL T×T attention, but causal flash/cuDNN kernels skip the masked upper
