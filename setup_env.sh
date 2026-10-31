@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
 # p4/setup_env.sh — one command to a working P4 environment on any pod.
 #
-#   bash setup_env.sh              # first time: builds everything. Afterwards: ~10s verify-only
+#   bash setup_env.sh              # first time: builds everything. Afterwards: fast verify-only
 #   bash setup_env.sh --relock     # after editing requirements.in: re-resolve + reinstall
 #   bash setup_env.sh --rebuild    # nuke the venv and rebuild from the lockfile
 #   source /workspace/p4/p4env.sh  # then, in every new shell
 #
-# Design (DEC-007): EVERYTHING lives on the PVC — uv, the Python interpreter itself, the
-# venv, the package cache. Pod deletion therefore costs nothing: a new pod just re-runs this,
-# hits the fast path, and verifies. The interpreter is uv-managed rather than the image's, so
-# the env also survives a change of container image (a venv normally breaks if the image's
-# Python moves). Only the NVIDIA DRIVER comes from the node, and that's checked at the end.
+# Design (DEC-007): the Python toolchain lives on the PVC — uv, interpreter, venv and
+# package cache. System packages (such as gcc/g++ for Triton) live in the container;
+# check them again after every pod recreation. The NVIDIA driver comes from the node.
 
 set -euo pipefail
 
 P4_ROOT=/workspace/p4
 REPO="$P4_ROOT/p4-pretrain"
-TOOLS=/workspace/tools                  # shared across projects: next project gets uv for free
+TOOLS=/workspace/tools                  # shared across projects
 ENV_DIR=/workspace/envs/p4
 PYVER=3.11
-# No PyTorch index needed: PyPI torch 2.8.0 already ships against the CUDA 12.8 runtime
-# (verified: nvidia-cuda-runtime-cu12 12.8.90, nvidia-nccl-cu12 2.27.3), which covers sm_100.
+# No PyTorch index needed: PyPI torch 2.8.0 ships with the CUDA 12.8 runtime,
+# which covers sm_100 on the B200.
 
 export UV_INSTALL_DIR="$TOOLS/bin"
 export UV_PYTHON_INSTALL_DIR="$TOOLS/python"
-export UV_CACHE_DIR=/workspace/.cache/uv          # same filesystem as the venv → hardlinks, fast
-export UV_PYTHON_PREFERENCE=only-managed          # never silently pick the image's python
+export UV_CACHE_DIR=/workspace/.cache/uv
+export UV_PYTHON_PREFERENCE=only-managed
 export PATH="$TOOLS/bin:$PATH"
 
 MODE=normal
@@ -38,6 +36,25 @@ esac
 
 say() { printf '\n\033[1m[setup]\033[0m %s\n' "$*"; }
 cd "$REPO"
+
+# ---- 0. Native compiler for Triton / torch.compile -------------------------------
+# System packages are NOT persisted on the PVC. The PyTorch venv survives pod
+# deletion, but gcc/g++/make may not. Check on each new GPU pod, even on the fast path.
+# CPU-only M2 pods do not require a native compiler just to process training data.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  if ! command -v gcc >/dev/null 2>&1 || \
+     ! command -v g++ >/dev/null 2>&1 || \
+     ! command -v make >/dev/null 2>&1; then
+    say "installing native compiler toolchain (Triton / torch.compile)"
+    if [[ "$(id -u)" -ne 0 ]] || ! command -v apt-get >/dev/null 2>&1; then
+      echo "ERROR: gcc/g++/make missing. Use a GPU container image with build-essential." >&2
+      exit 1
+    fi
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential
+  fi
+  say "native compiler: gcc $(gcc -dumpversion); g++ $(g++ -dumpversion)"
+fi
 
 # ---- 1. uv ---------------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
@@ -57,8 +74,6 @@ uv python install "$PYVER" >/dev/null
 say "python $PYVER (uv-managed, $UV_PYTHON_INSTALL_DIR)"
 
 # ---- 3. lockfile ---------------------------------------------------------------------
-# Resolve ONCE, commit the result, install from it forever after. This is what makes the
-# env on the 4×B200 pod byte-identical to the one you debugged on 1 GPU.
 if [[ ! -f requirements.lock || "$MODE" == relock ]]; then
   say "resolving requirements.in → requirements.lock"
   uv pip compile requirements.in -o requirements.lock \
@@ -67,7 +82,6 @@ if [[ ! -f requirements.lock || "$MODE" == relock ]]; then
   echo "# p4-in-hash: $(sha256sum requirements.in | cut -c1-16)" >> requirements.lock
   say "NEW LOCKFILE — commit it from this pod: git add requirements.in requirements.lock"
 fi
-# Guard: requirements.in edited but never relocked → the edit would be silently ignored.
 IN_HASH=$(sha256sum requirements.in | cut -c1-16)
 if ! grep -qx "# p4-in-hash: $IN_HASH" requirements.lock; then
   echo "ERROR: requirements.in changed since requirements.lock was generated."
@@ -76,7 +90,7 @@ if ! grep -qx "# p4-in-hash: $IN_HASH" requirements.lock; then
 fi
 LOCK_HASH=$(sha256sum requirements.lock | cut -c1-16)
 
-# ---- 4. venv + packages (fast path if the stamp matches the lockfile) ----------------
+# ---- 4. venv + packages (fast path if the stamp matches the lockfile) ---------------
 STAMP="$ENV_DIR/.p4_lock_hash"
 [[ "$MODE" == rebuild && -d "$ENV_DIR" ]] && { say "removing $ENV_DIR"; rm -rf "$ENV_DIR"; }
 
@@ -85,29 +99,31 @@ if [[ -x "$ENV_DIR/bin/python" && -f "$STAMP" && "$(cat "$STAMP")" == "$LOCK_HAS
 else
   [[ -x "$ENV_DIR/bin/python" ]] || { say "creating venv at $ENV_DIR"; uv venv --python "$PYVER" "$ENV_DIR" --quiet; }
   say "syncing packages from lockfile (first run downloads ~3 GB of CUDA wheels; later runs reuse the cache)"
-  # sync, not install: also REMOVES anything not in the lock, so drift can't accumulate
   uv pip sync requirements.lock --python "$ENV_DIR/bin/python"
   echo "$LOCK_HASH" > "$STAMP"
 fi
 
 # ---- 5. per-shell environment file ---------------------------------------------------
-cat > "$P4_ROOT/p4env.sh" <<EOF
+# Generated, not committed. NEVER edit p4env.sh by hand; changes belong here.
+cat > "$P4_ROOT/p4env.sh" <<EOF_ENV
 # generated by setup_env.sh — source this in every new shell
 export PATH="$TOOLS/bin:\$PATH"
 export UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" UV_CACHE_DIR="$UV_CACHE_DIR"
 export HF_HOME=/workspace/.huggingface
 export TOKENIZERS_PARALLELISM=false
+# A launcher sets TORCHINDUCTOR_CACHE_DIR to a backend-specific subdirectory
+# BEFORE Python imports torch. See run_train.sh for compiled benchmarks.
+export P4_INDUCTOR_CACHE_ROOT=/workspace/.cache/p4-inductor
 source "$ENV_DIR/bin/activate"
 cd "$REPO"
-EOF
+EOF_ENV
 
 # ---- 6. git: things that live in ~ and die with the pod ------------------------------
-# PVC files often aren't owned by the pod's user → git refuses with "dubious ownership".
 git config --global --get-all safe.directory 2>/dev/null | grep -qx "$REPO" \
   || git config --global --add safe.directory "$REPO"
-CRED="$P4_ROOT/.secrets/git-credentials"        # fine-grained PAT, this repo only, chmod 600
+CRED="$P4_ROOT/.secrets/git-credentials"
 if [[ -f "$CRED" ]]; then
-  git config credential.helper "store --file=$CRED"   # repo-local config → lives on the PVC
+  git config credential.helper "store --file=$CRED"
 fi
 
 # ---- 7. verify: fail loudly on this node, not 40 minutes into a run -------------------
@@ -135,17 +151,12 @@ for i in range(torch.cuda.device_count()):
     line(f"GPU {i}", f"{torch.cuda.get_device_name(i)}  {sm}  "
                      f"{'ok' if supported else 'NOT IN THIS TORCH BUILD — will fail with no kernel image'}")
 
-# real work, not just import: bf16 matmul on the device
 a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 torch.cuda.synchronize(); (a @ a).sum().item()
 line("bf16 matmul", "ok")
 
-# Which attention backends actually run on THIS hardware. Silent fallback to a slower
-# backend is the ISSUE-002 failure pattern; M1 pins one explicitly based on this list.
 from torch.nn.attention import sdpa_kernel, SDPBackend
 import torch.nn.functional as F
-# Probe forward AND backward: training needs both, and a backend can support the forward
-# pass while failing the backward one. Shape = the 1.3B model's attention (16 heads x 128).
 avail = []
 for be in (SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
            SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH):
