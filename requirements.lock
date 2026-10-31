@@ -58,6 +58,8 @@ idna==3.20
     #   httpx2
     #   requests
     #   yarl
+iniconfig==2.3.1
+    # via pytest
 jinja2==3.1.6
     # via torch
 kiwisolver==1.5.1
@@ -125,18 +127,25 @@ packaging==26.3
     #   datasets
     #   huggingface-hub
     #   matplotlib
+    #   pytest
 pandas==3.0.6
     # via datasets
 pillow==12.3.0
     # via matplotlib
+pluggy==1.7.0
+    # via pytest
 propcache==0.5.4
     # via
     #   aiohttp
     #   yarl
 pyarrow==26.0.0
     # via datasets
+pygments==2.21.0
+    # via pytest
 pyparsing==3.3.3
     # via matplotlib
+pytest==9.2.0
+    # via -r requirements.in
 python-dateutil==2.9.0.post0
     # via
     #   matplotlib
@@ -185,4 +194,4 @@ xxhash==4.0.1
     # via datasets
 yarl==1.25.1
     # via aiohttp
-# p4-in-hash: f836244f7b8aee4d
+# p4-in-hash: cfce232dbc726eeb
