@@ -56,7 +56,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 |----|-------|------|--------|----------|
 | M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ✅ 1×B200 env verified · ⬜ 4×B200 NCCL rerun | 4-GPU session |
 | M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
-| M2 | Data pipeline (tokenize→dedup→filter→pack→shard) | **0** (CPU) | ⬜ not started | — |
+| M2 | Data pipeline (ingest→filter→exact/near dedup→group split→tokenize→shard) | **0** (CPU) | ✅ M2-001…006 implemented and committed; ✅ M2-007 500-doc real-data pilot audited; ⬜ final CPU training smoke / M2-007 commit pending | Larger real corpus + clean 125M loss curve remain separate |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ⬜ not started | M1, M2 |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
@@ -667,4 +667,172 @@ _Future pitch template only; do not present these milestones as completed until 
 | Fault tolerance? | Checkpoint/resume survives a mid-run `kill -9`; tested by __ at step __, resumed to identical loss trajectory |
 | fp8? | __× throughput over bf16 at __ loss delta; watched range/overflow in __ |
 | Hardest bug? | ISSUE-004: requested cuDNN but compiler cache reused Flash; profiler guard caught backend mismatch |
+| Data pipeline proof? | M2: 500 real FineWeb-Edu docs; no qualifying Jaccard≥0.8 pairs among 124,750 audited pairs; 429,605 train + 47,014 validation GPT-2 tokens; sharded files reconstruct byte-for-byte; 500-doc pilot, not a model-quality study |
 | Something that didn't work? | NEG-__ |
+
+
+---
+
+## 7. M2 — CPU Data Pipeline: Implementation, Audits, and Reproducibility
+
+**Dates:** 2026-11-02 (pilot checks and data artifacts). **Hardware:** CPU pod `ml-cpu`, namespace `thme5878`, Python 3.11.17 in `/workspace/envs/p4`, using the PVC under `/workspace`. No GPU was needed for the pipeline tests or the real-data pilot.
+
+**Status as of this log revision:** M2-001…006 **implemented, tested, and committed**; M2-007 **real-data pilot produced and audited**, with its adapter tests passing independently. The final M2-007 full-suite rerun, M2-007 commit, and `gpt-tiny` real-data optimizer-step smoke test **have not been shown as completed** in the recorded outputs. A larger corpus and a meaningful GPT-125M loss curve are **not yet complete**. The last confirmed M2-006 commit is `b887a08`.
+
+### 7.1 Objective and end-to-end contract
+
+Build a CPU-first, reproducible pretraining data path that consumes text and emits data compatible with the **existing** `train.py` `MemmapBatches` reader:
+
+```text
+Hugging Face source (M2-007) → raw.jsonl + provenance + source manifest
+  → ingest.py                  validate, NFC-normalize, SHA-256
+  → filter_stream.py           rule-based rejection statistics
+  → exact_dedup.py            disk-backed SQLite SHA-256 uniqueness
+  → near_dedup.py             3-word shingles → MinHash → LSH candidates
+                                → exact Jaccard verification → union-find groups
+  → split.py                  seeded, group-aware train/validation manifest
+  → tokenize.py               GPT-2 IDs + one EOT per document → flat uint16 LE .bin
+  → shard.py                  ordered token shards + offsets + SHA-256 manifest
+```
+
+- **Data outside Git:** pilot and intermediate files remain in `/workspace/p4/m2-data/`, not in the public source repository. Code, tests, and human-readable findings belong in Git.
+- **Failure safety:** ingestion, quality filtering, exact dedup, and near dedup use temporary-output publication; split/tokenize/shard stages publish a complete new output directory, and refuse existing destinations. These mechanisms protect against ordinary processing errors; no power-loss/crash durability guarantee is claimed.
+- **Memory:** ingest tracks seen IDs in RAM; near dedup retains document signatures/shingle sets/groups in RAM; `split.py` retains group records. Exact dedup's fingerprint index is SQLite-backed. The 500-document pilot does **not** establish scalability to billions of documents.
+- **Reproducibility boundary:** the same *input bytes, order (where applicable), seed, code, tokenizer, and configuration* should produce the same output. Near-dedup representatives and `group-000...` labels depend on input order; group-level split assignment uses stable member identities, but may change if group membership changes.
+
+### 7.2 M2-001 — Streaming ingestion
+
+- **Implemented:** `data_pipeline/ingest.py`, fixture `data_pipeline/fixtures/sample.jsonl`, tests `tests/test_ingest.py`.
+- **Contract:** require nonempty string `id`/`source`, string `text`, reject duplicate `(source,id)` identities, normalize CRLF/CR to LF, NFC-normalize Unicode, strip outside whitespace, skip blank normalized text, compute SHA-256 from normalized UTF-8 text, and write validated JSONL in a deterministic order.
+- **Safety:** same-directory temp file, flush/fsync, `os.replace`; a failed input does not replace a preexisting output.
+- **Synthetic fixture:** 3 accepted documents, including an exact duplicate of the first text under a separate identity; ingestion deliberately does not deduplicate content.
+- **Tests:** six ingestion tests passed when first implemented. **Scaling caveat:** seen document identities are an in-memory set.
+
+### 7.3 M2-002 — Quality rules and streaming filter
+
+- **Implemented:** `data_pipeline/quality_filter.py`, `data_pipeline/filter_stream.py`, `tests/test_quality_filter.py`, `tests/test_filter_stream.py`.
+- **Default rules, applied in order:** minimum 30 words; maximum 100,000 words; Unicode alphabetic fraction of non-whitespace characters at least 0.50; duplicated nonblank-line fraction no more than 0.30. A rejected document is attributed to its **first** failing rule.
+- **Output:** accepted original JSONL rows, counts for seen/accepted/rejected/blank lines, and four rejection reasons; atomic replacement on successful completion.
+- **Initial tests:** 18 tests passed across ingestion and quality components. For the three-document smoke fixture, a deliberately lowered `--min-words 3` accepted all three.
+- **Real-data pilot (M2-007):** 500 seen, 500 accepted, **0 rejected** across all four rules. This is consistent with an already curated FineWeb-Edu slice; it **does not** validate usefulness or fairness of these thresholds on raw Common Crawl.
+
+### 7.4 M2-003 — Exact and near-duplicate detection
+
+**Exact deduplication (`data_pipeline/exact_dedup.py`):**
+
+- Recomputes and validates `sha256` from each record's text. `INSERT OR IGNORE` into a temporary SQLite primary-key index retains the **first** occurrence of identical normalized text regardless of `source`/`id`; subsequent records are removed.
+- Synthetic fixture: **3 seen → 2 unique, 1 removed**. Existing output remains intact if input validation fails. Test suite at this point: **54 passed, 3 skipped**.
+- Real FineWeb-Edu slice: **500 seen → 500 unique; 0 exact duplicates removed**.
+
+**Near deduplication (`minhash_lsh.py`, `near_dedup.py`):**
+
+| Parameter | Pilot setting |
+|---|---:|
+| Shingling | Case-folded word 3-grams; punctuation ignored for matching |
+| Signature | 112 deterministic MinHash values; seed 42 |
+| LSH layout | 14 bands × 8 rows |
+| Verification threshold | Exact shingle-set Jaccard ≥ 0.8 |
+| Group construction | Union-find connected components; all documents indexed |
+| Representative | First input occurrence per detected component |
+
+- LSH returns *candidate pairs*, not confirmed duplicates. Only exact Jaccard verification creates a similarity edge. Transitive union-find groups can connect A and C through B when A and C are not directly above threshold.
+- **Controlled candidate-recall experiment:** 23 synthetic documents (3 groups of 6 shifted, overlapping documents + 5 unrelated). There are **253** possible pairs, of which **36** have true Jaccard ≥ 0.8. LSH returned **33** candidates; **31** were true matches and **2** were nonmatches. Thus pairwise candidate recall **31/36 = 86.11%**, candidate precision **31/33 = 93.94%**, and **5 true pairs were missed**. Relative to all-pairs exact Jaccard, **(253−33)/253 = 86.96% fewer candidate-verification comparisons**; this is *not* a wall-time speedup.
+- **Connected-component recovery on the same synthetic fixture:** 8 detected components with sizes **[6, 6, 6, 1, 1, 1, 1, 1]**. All three intended six-document components were recovered, despite the five missed pairwise edges. This is fixture-specific success, **not** a guarantee of complete leakage prevention.
+- **Real FineWeb-Edu slice:** 500 documents; **0 LSH candidate pairs, 0 verified edges, 500 singleton groups**, 0 documents removed. Single observed CPU near-dedup runtime **10.249 s elapsed** (10.057 s user CPU / 0.065 s system); about **48.8 documents/s** on this specific sample. No repeated timings or scaling fit were performed.
+- **Independent exhaustive real-data audit:** 500 documents give **124,750** unordered pairs. A mathematically safe shingle-set size-ratio bound pruned **107,665** pairs; **17,085** pairwise intersections/unions were evaluated; **0** pairs reached Jaccard ≥ 0.8. Audit runtime **0.33 s** for the separate precomputed-shingle comparison loop. This supports the conclusion that the real pilot contains **zero qualifying 3-gram/Jaccard-0.8 pairs**; it cannot measure recall when no positives exist.
+- **Limits:** MinHash/LSH retrieval is probabilistic, and missed edges can split true components. The in-memory MinHash/Shingle-set implementation is a small-corpus reference, not a demonstrated large-scale deduplicator.
+
+### 7.5 M2-004 — Deterministic group-aware splitting
+
+- **Implemented:** `data_pipeline/split.py`; tests `tests/test_split.py` (**7 passed**).
+- **Principle:** assign each detected component *as one unit* to train or validation. The canonical key hashes sorted `(source,id)` member identities, not the order-sensitive `group-000...` label. Seeded SHA-256 ranking gives deterministic group assignments for fixed membership; the new output directory contains `train.jsonl`, `val.jsonl`, `manifest.json`.
+- **Synthetic experiment:** 8 detected groups split **6 train / 2 validation** at requested `val_fraction=0.25`, seed 42. The group-weighted original member counts were **21 train / 2 validation**, or only **8.7%** of original documents in validation. Group-count balancing is **not** document- or token-count balancing.
+- **Real FineWeb-Edu experiment:** all 500 groups were singletons, yielding **450 train / 50 validation** documents and groups, seed 42, fraction 0.10.
+- **Leakage qualification:** detected groups do not cross splits by construction; unseen/undetected similarities, or a change in how the groups were generated, can still produce leakage. The split manifest records the particular assignment; it is not a proof of corpus-level independence.
+
+### 7.6 M2-005 — GPT-2 tokenization and flat packing
+
+- **Implemented:** `data_pipeline/tokenize.py`; tests `tests/test_tokenize.py` (**6 passed**).
+- **Tokenizer:** `tiktoken.get_encoding('gpt2')`; actual vocabulary **50,257**, EOT token **50,256**. This is distinct from the model's **50,304 padded vocabulary**. Ordinary text is tokenized with `encode_ordinary` so literal strings resembling special tokens remain ordinary text.
+- **Format:** append one EOT ID after each document; write one continuous, little-endian `uint16` token stream per split, not precomputed independent 1,024-token blocks. Manifests contain source/output SHA-256 hashes, document counts, content-token counts, boundary counts, and totals. `train.py` samples next-token windows from the flat stream.
+- **Synthetic split:** train **3,009** tokens across 6 representative documents, validation **1,004** tokens across 2. The **1,004-token validation file is insufficient for the 1,024-token reader**. `MemmapBatches` was separately tested on CPU with `(B,T)=(2,1024)` for train and `(2,64)` for validation; both input-target shifts and vocab bounds passed. This is a compatibility test, not a validation-loss experiment.
+- **Real FineWeb-Edu split:** both files are long enough for the `train.py` `block_size=1024` reader. See the final token-count table in §7.9. Real-data GPT training backward/optimizer-step verification is **pending**.
+
+### 7.7 M2-006 — Lossless binary sharding
+
+- **Implemented:** `data_pipeline/shard.py`; tests `tests/test_shard.py` (**7 passed**).
+- **Protocol:** split the flat `uint16` stream into ordered, size-limited shard files. Record per-shard filenames, start/end-exclusive token offsets, token/EOT counts, and SHA-256 checksums; refuse malformed input and publish only after all checks succeed. The source file's byte stream is **never retokenized**.
+- **Synthetic trial:** 2,048-token shard cap produced **2 training shards** (2,048 + 961 tokens) and **1 validation shard** (1,004 tokens). Reassembling shard bytes in order matched both original `.bin` files exactly.
+- **Real trial:** 100,000-token shard cap produced **5 train shards** and **1 validation shard**. Both reconstructed token streams matched the original token counts and SHA-256 values exactly.
+- **Reader boundary:** individual shard files are **not automatically valid `MemmapBatches` inputs**. Training currently consumes the original flat `.bin` files; a shard-aware reader with a documented cross-shard window policy is a separate task.
+- **Most recent complete full regression suite shown after M2-006:** **86 passed, 3 skipped, 0 failures**. Three skips were reported; their reasons were not rechecked in this log.
+
+### 7.8 M2-007 — FineWeb-Edu real-data provenance and extraction
+
+**Source:** `HuggingFaceFW/fineweb-edu`, configuration `sample-10BT`, streamed `train` split. The extraction manifest records revision `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`. Selection was **the first 500 nonempty streamed documents**—*not* a randomized or representative sample. The adapter lives in `data_pipeline/fetch_fineweb.py` with offline tests `tests/test_fetch_fineweb.py` (**5 passed**).
+
+| Provenance item | Recorded value |
+|---|---|
+| Dataset / configuration | `HuggingFaceFW/fineweb-edu` / `sample-10BT` |
+| Revision | `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9` |
+| License (per source manifest) | ODC-By 1.0; Common Crawl terms also apply |
+| Export requested / rows seen | 500 / 500 |
+| Documents exported / blank rows skipped | 500 / 0 |
+| Raw export SHA-256 | `cbf13c8ebd881bb4e41c35e2d4301549800d932780d3883d022ed457be001462` |
+| Provenance SHA-256 | `5772c2995cc9ef5845e25c26c499cc92722d05161f6e6394a60c60c3cafc3da7` |
+
+- `raw.jsonl` contains the input text/IDs; `provenance.jsonl` retains source URL, Common Crawl dump, date, and file path where present. `source_manifest.json` records the selection rule, revision, license/terms information, counts, and file checksums. The existing `ingest.py` intentionally strips extra metadata, so provenance is kept separately.
+- **Provenance boundary:** recording a dataset-level license and URL does not independently clear rights for every crawled page. Do not publish the raw FineWeb sample in the source Git repository without a separate review.
+- Real-data ingestion wrote **500 documents**, skipping 0 empty. Quality filtering accepted **500/500**, with zero rejections under any of the four configured rules. Exact/near dedup retained **500/500**, with zero confirmed duplicates; the exhaustive audit appears in §7.4.
+- The pinned dataset revision, selected-row ordering, input sha256, and code should be retained when attempting reproduction. No separate independent dataset-card/revision audit is claimed here; these are values reported by the successfully executed extraction manifest.
+
+### 7.9 Real-data final output and checksums
+
+| Quantity | Train | Validation | Total |
+|---|---:|---:|---:|
+| Representative documents (singleton groups) | 450 | 50 | **500** |
+| GPT-2 content tokens | 429,155 | 46,964 | **476,119** |
+| EOT boundary tokens | 450 | 50 | **500** |
+| Total stored token IDs | **429,605** | **47,014** | **476,619** |
+| Storage as uint16 | 859,210 bytes | 94,028 bytes | 953,238 bytes |
+| 100,000-token-cap shards | 5 | 1 | **6** |
+| `block_size=1024` reader length check | Passed | Passed | — |
+
+**Verified source-to-binary hashes:**
+
+| File or manifest | SHA-256 |
+|---|---|
+| `fineweb_split_v1/manifest.json` | `9d28c558ec47ef9624e3b4794f0a1a701a0e6e69971172c6fe6e636db5b15f4c` |
+| `fineweb_tokens_v1/train.bin` | `9349ea092c19a94fafb924b7409ccef00a9f2deabfba476fd5dbc379b80b4c43` |
+| `fineweb_tokens_v1/val.bin` | `62acffe82571907bfefa88bb0a03a083b49ce70bce128fff76ce631d224d84a3` |
+
+The tokenization and sharding manifests independently reported matching **total tokens, EOT counts, and stream SHA-256** values for both splits. The synthetic trial also passed direct byte-for-byte shard reassembly. On the real pilot, counts/checksums matched; a separate direct byte-by-byte reassembly loop was not reported. Those distinctions are kept explicit.
+
+**Current data paths on the PVC:**
+
+```text
+/workspace/p4/m2-data/
+  fineweb_pilot_500/        raw.jsonl, provenance.jsonl, source_manifest.json
+  fineweb_ingested.jsonl
+  fineweb_filtered.jsonl
+  fineweb_exact_dedup.jsonl
+  fineweb_near_dedup.jsonl
+  fineweb_split_v1/         train.jsonl, val.jsonl, manifest.json
+  fineweb_tokens_v1/        train.bin, val.bin, tokenization_manifest.json
+  fineweb_shards_v1/        train-*.bin, val-*.bin, shard_manifest.json
+```
+
+### 7.10 Measurement interpretation, limitations, and next actions
+
+**Established:** the CPU pipeline processes an actual 500-document web-text sample without a reported failure, produces deterministic structures and checksummed binary outputs, and preserves detected duplicate groups across the train/validation split. Both real-data flat token streams satisfy the existing training reader's length condition. The Jaccard audit validates the zero-near-duplicate finding for **this exact sample and similarity definition**.
+
+**Not established:** any improvement in model loss/quality; statistical representativeness; recall on a real dataset containing confirmed near-duplicates; large-corpus performance, disk usage, or memory bounds for the near-dedup index; true training performance from these token files; elimination of unseen cross-split leakage; or dataset-wide licensing clearance. One synthetic sample is a code-validation fixture, not an empirical benchmark of LSH recall across the web.
+
+**Explicit follow-up checks (not yet verified in the supplied run outputs):**
+
+1. Run `python -m pytest -q` with the M2-007 files added. The previous full suite reported **86 passed, 3 skipped**; the five new exporter tests passed separately. **91 passed / 3 skipped is an expectation, not an observed full-suite result.**
+2. Smoke-test a **real-data** CPU forward, next-token loss, backward, and AdamW update with `train.py --model gpt-tiny --device cpu --data /workspace/p4/m2-data/fineweb_tokens_v1/train.bin --micro-bs 1 --steps 1 --bench-warmup 0 --log-every 1 --lr-warmup 1 --dry-run`. This is not a 125M pretraining result.
+3. Commit `data_pipeline/fetch_fineweb.py`, `tests/test_fetch_fineweb.py`, and this lab-log update after verifying the above. Last *confirmed* push was M2-006; no M2-007 push outcome was supplied.
+4. For a meaningful clean GPT-125M from-scratch loss curve, scale to an appropriately sized reproducible real-text dataset, monitor PVC/cache usage, record dedup/quality statistics and validation-token coverage, then reserve a GPU. Keep this objective separate from upcoming M3 4-GPU communication/scaling comparisons.
+
+**Decision for M3:** M2's pilot validates the data-path format and audit workflow, but is **not** a prerequisite to keep enlarging the corpus before coding/debugging DDP. Do not confuse pipeline completeness with the much larger training-data budget required for model-quality experiments.
