@@ -48,13 +48,26 @@ REAL_VOCAB = 50257              # ids >= this are vocab padding: never sampled a
 
 # ---- distributed plumbing --------------------------------------------------------------
 
-def setup_dist():
-    """torchrun sets WORLD_SIZE/RANK/LOCAL_RANK; plain `python` sets nothing → world 1."""
+def setup_dist(device: str = "auto"):
+    """Use Gloo for CPU DDP and NCCL for GPU DDP."""
     world = int(os.environ.get("WORLD_SIZE", "1"))
-    rank, local_rank = int(os.environ.get("RANK", "0")), int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
     if world > 1:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
+        use_cuda = device.startswith("cuda") or (
+            device == "auto" and torch.cuda.is_available()
+        )
+
+        if use_cuda:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA DDP requested without CUDA")
+            torch.cuda.set_device(local_rank)
+
+        dist.init_process_group(
+            backend="nccl" if use_cuda else "gloo"
+        )
+
     return rank, world, local_rank
 
 
@@ -222,7 +235,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> dict:
     args = parse_args(argv)
-    rank, world, local_rank = setup_dist()
+    rank, world, local_rank = setup_dist(args.device)
     master = rank == 0
     say = print if master else (lambda *a, **k: None)
 
@@ -266,7 +279,7 @@ def main(argv=None) -> dict:
     ddp_model = None
     if world > 1:                                # unvalidated until M3
         from torch.nn.parallel import DistributedDataParallel as DDP
-        ddp_model = model = DDP(model, device_ids=[local_rank])
+        ddp_model = model = DDP(model, device_ids=[local_rank] if on_cuda else None)
     if args.compile:
         model = torch.compile(model)             # compile(DDP(m)): lets DDPOptimizer split at buckets
 
