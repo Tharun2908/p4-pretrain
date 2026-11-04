@@ -218,7 +218,7 @@ def parse_args(argv=None):
     p.add_argument("--model", default="gpt-125m", choices=sorted(ALL_MODELS))
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--compile", action="store_true")
-    p.add_argument("--strategy", choices=["ddp", "fsdp-grad", "fsdp-full"],
+    p.add_argument("--strategy", choices=["ddp", "zero1", "fsdp-grad", "fsdp-full"],
                    default="ddp", help="Distributed training strategy")
     p.add_argument("--deterministic", action="store_true",
                    help="Enable deterministic PyTorch algorithms for reproducibility")
@@ -262,11 +262,11 @@ def main(argv=None) -> dict:
     cfg = ALL_MODELS[args.model]
     if args.strategy != "ddp":
         if world < 2 or not on_cuda:
-            raise SystemExit("FSDP requires at least two CUDA ranks for M4")
+            raise SystemExit("Sharded strategies require at least two CUDA ranks for M4")
         if args.compile:
-            raise SystemExit("FSDP + torch.compile not yet validated in M4")
+            raise SystemExit("Sharded strategies + torch.compile not yet validated in M4")
         if args.grad_accum != 1:
-            raise SystemExit("FSDP gradient accumulation not yet validated in M4")
+            raise SystemExit("Sharded strategy gradient accumulation not yet validated in M4")
 
     # steps are counted AFTER step 0, so windows end at log_every, 2·log_every, … steps
     if args.bench_warmup % args.log_every:
@@ -294,6 +294,7 @@ def main(argv=None) -> dict:
         rec = RunRecord(run_id=args.run_id, question=args.question, prediction=args.prediction,
                         strategy=("single" if world == 1 else {
                             "ddp": "DDP",
+                             "zero1": "ZeRO-1",
                             "fsdp-grad": "FSDP-SHARD_GRAD_OP",
                             "fsdp-full": "FSDP-FULL_SHARD",
                         }[args.strategy]),
@@ -315,7 +316,7 @@ def main(argv=None) -> dict:
     ddp_model = None
     fsdp_model = None
 
-    if args.strategy == "ddp":
+    if args.strategy in ("ddp", "zero1"):
         if world > 1:
             from torch.nn.parallel import DistributedDataParallel as DDP
             ddp_model = model = DDP(
@@ -357,10 +358,29 @@ def main(argv=None) -> dict:
 
     # Optimizer is created AFTER FSDP wrapping, but retains the
     # original weight-decay versus no-decay classification.
-    opt = build_optimizer(
-        raw_model, args.lr, args.weight_decay, device,
-        decay_param_ids=decay_param_ids if fsdp_model is not None else None,
-    )
+    if args.strategy == "zero1":
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+
+        params = list(raw_model.parameters())
+        decay = [p for p in params if id(p) in decay_param_ids]
+        no_decay = [p for p in params if id(p) not in decay_param_ids]
+
+        opt = ZeroRedundancyOptimizer(
+            [
+                {"params": decay, "weight_decay": args.weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            optimizer_class=torch.optim.AdamW,
+            lr=args.lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=on_cuda,
+        )
+    else:
+        opt = build_optimizer(
+            raw_model, args.lr, args.weight_decay, device,
+            decay_param_ids=decay_param_ids if fsdp_model is not None else None,
+        )
 
     if args.data == "synthetic":
         batches = SyntheticBatches(args.micro_bs, cfg.block_size, device, seed=args.seed + rank)
