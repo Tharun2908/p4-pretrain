@@ -58,7 +58,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
 | M2 | Data pipeline (ingest→filter→exact/near dedup→group split→tokenize→shard) | **0** (CPU) | ✅ M2-001…006 implemented and committed; ✅ M2-007 500-doc real-data pilot audited; ⬜ final CPU training smoke / M2-007 commit pending | Larger real corpus + clean 125M loss curve remain separate |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization and deterministic replay checks passed; numerical reproducibility follow-up open | Document findings |
-| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | 🟡 ZeRO-2/3 benchmarks completed at both sizes; ZeRO-1 pending | M3 |
+| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ✅ Core ZeRO-1/2/3 benchmarks completed at both sizes; follow-ups documented | M3 |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
 | M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
@@ -385,11 +385,14 @@ transferring at three-quarters of achievable bandwidth.
   on-device batches, microbatch 16/GPU, sequence length 1024,
   gradient accumulation 1, 200 training steps, 50 excluded warmup
   steps, 150 measured steps.
-- **Implementation:** nested PyTorch FSDP with
+- **Implementation:** ZeRO-1 via DDP + `ZeroRedundancyOptimizer`;
+  ZeRO-2/3 via nested PyTorch FSDP with
   `SHARD_GRAD_OP` (ZeRO-2-like) and `FULL_SHARD` (ZeRO-3-like),
   `use_orig_params=True`, tied embedding/head weights owned by the
   root FSDP unit, fused AdamW, and FSDP-aware gradient clipping.
-- **Correctness:** both sharding strategies passed three-step
+- **Correctness:** ZeRO-1 passed FP32/AdamW parameter-update and
+  learning-rate schedule parity against DDP. Both FSDP strategies
+  passed three-step
   FP32/SGD parameter-update parity against DDP (maximum observed
   difference 0.000e+00), BF16/Flash/AdamW execution tests, optimizer
   parameter-group checks, and GPT-125M/1.3B smoke tests.
@@ -397,10 +400,12 @@ transferring at three-quarters of achievable bandwidth.
 | Run | Model | Strategy | Throughput (tok/s) | Peak GB/GPU | MFU |
 |---|---|---|---:|---:|---:|
 | M3-001 | 125M | DDP eager baseline | 1,734,601 | 17.68 | 16.49% |
+| M4-006 | 125M | ZeRO-1 | 1,583,664 | 17.0 | 15.05% |
 | M4-001 | 125M | ZeRO-2 initial | 1,380,219 | 16.6 | 13.12% |
 | M4-002 | 125M | ZeRO-3 | 1,553,383 | 16.3 | 14.76% |
 | M4-003 | 125M | ZeRO-2 repeat | 1,641,148 | 16.6 | 15.60% |
 | M3-003 | 1.3B | DDP eager baseline | 335,788 | 62.8 | 31.61% |
+| M4-007 | 1.3B | ZeRO-1 | 330,372 | 54.9 | 31.11% |
 | M4-004 | 1.3B | ZeRO-2 | 342,653 | 51.0 | 32.26% |
 | M4-005 | 1.3B | ZeRO-3 | 340,166 | 46.3 | 32.03% |
 
@@ -415,8 +420,22 @@ transferring at three-quarters of achievable bandwidth.
 - M4-004: memory prediction met; throughput exceeded the upper
   predicted bound of 335K tok/s.
 - M4-005: throughput and memory predictions met.
+- M4-006: throughput prediction 1.55–1.75M tok/s and memory
+  prediction 17.0–17.5 GB/GPU both met. Slow timing windows
+  affected the last 20 measured steps.
+- M4-007: throughput prediction 300–350K tok/s and memory
+  prediction 54–60 GB/GPU both met.
 
 **Findings**
+
+- ZeRO-1 at 125M saved approximately 3.8% peak allocated memory
+  against DDP; at 1.3B it saved approximately 12.6%.
+- At 1.3B, ZeRO-1 measured 330,372 tok/s, approximately 1.6%
+  below the eager DDP baseline, while saving 7.9 GB/GPU.
+- ZeRO-1 at 125M had per-rank peak allocations of
+  17.001, 16.913, 16.915 and 16.912 GB (0.089 GB spread).
+- ZeRO-1 at 1.3B had per-rank peak allocations of 54.903, 54.900, 54.886, 54.886 GB (spread 0.017 GB).
+
 
 - At 125M, peak memory fell from 17.68 GB/GPU under DDP to 16.6
   with ZeRO-2 and 16.3 with ZeRO-3: approximately 6.1% and 7.8%
@@ -440,10 +459,13 @@ transferring at three-quarters of achievable bandwidth.
   The JSON warmup metadata issue described in M3 remains; actual
   timing excludes the first 50 training steps.
 
-**Artifacts:** `runs/M4-001.json` through `runs/M4-005.json`.
+**Artifacts:** `runs/M4-001.json` through `runs/M4-007.json`.
 
-**Remaining scope:** ZeRO-1 implementation/measurement, possible
-repeat runs and reproducibility investigation, then M4 synthesis.
+**M4 status:** Core benchmark matrix completed: DDP versus ZeRO-1,
+ZeRO-2 and ZeRO-3 at 125M and 1.3B. Remaining follow-ups include
+BF16/AdamW numerical reproducibility, additional performance
+repetitions, and causal communication profiling. Small throughput
+differences should not be interpreted as definitive strategy rankings.
 
 ---
 
