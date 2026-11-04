@@ -65,7 +65,8 @@ def setup_dist(device: str = "auto"):
             torch.cuda.set_device(local_rank)
 
         dist.init_process_group(
-            backend="nccl" if use_cuda else "gloo"
+            backend="nccl" if use_cuda else "gloo",
+            device_id=torch.device(f"cuda:{local_rank}") if use_cuda else None,
         )
 
     return rank, world, local_rank
