@@ -210,6 +210,8 @@ def parse_args(argv=None):
     p.add_argument("--model", default="gpt-125m", choices=sorted(ALL_MODELS))
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--deterministic", action="store_true",
+                   help="Enable deterministic PyTorch algorithms for reproducibility")
     p.add_argument("--backend", default="auto", choices=["auto", *BACKENDS],
                    help="SDPA backend; 'auto' = PyTorch's own dispatch (still recorded)")
     p.add_argument("--data", default="synthetic", help="'synthetic' or path to a uint16 .bin")
@@ -235,6 +237,10 @@ def parse_args(argv=None):
 
 def main(argv=None) -> dict:
     args = parse_args(argv)
+    if args.deterministic:
+        # Must be configured before initializing CUDA.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
     rank, world, local_rank = setup_dist(args.device)
     master = rank == 0
     say = print if master else (lambda *a, **k: None)
@@ -253,7 +259,8 @@ def main(argv=None) -> dict:
 
     tokens_per_step = args.micro_bs * args.grad_accum * cfg.block_size * world
     config = dict(model=cfg.name, n_params=cfg.n_params, world_size=world, device=device,
-                  compile=args.compile, backend=args.backend, data=args.data,
+                  compile=args.compile, deterministic=args.deterministic,
+                  backend=args.backend, data=args.data,
                   micro_bs=args.micro_bs, grad_accum=args.grad_accum,
                   block_size=cfg.block_size, tokens_per_step=tokens_per_step,
                   steps=args.steps, bench_warmup=args.bench_warmup, log_every=args.log_every,
