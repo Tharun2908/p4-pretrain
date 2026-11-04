@@ -54,10 +54,10 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 
 | M# | Label | GPUs | Status | Blocking |
 |----|-------|------|--------|----------|
-| M0 | Env + NCCL sanity | 1 → 4 | ✅ A100 ref (195 GB/s) · ✅ 1×B200 env verified · ⬜ 4×B200 NCCL rerun | 4-GPU session |
+| M0 | Env + NCCL sanity | 1 → 4 | ✅ B200 4-rank NCCL verified; 651.1 GB/s peak ring-equivalent bus bandwidth; repeat confirmed | — |
 | M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
 | M2 | Data pipeline (ingest→filter→exact/near dedup→group split→tokenize→shard) | **0** (CPU) | ✅ M2-001…006 implemented and committed; ✅ M2-007 500-doc real-data pilot audited; ⬜ final CPU training smoke / M2-007 commit pending | Larger real corpus + clean 125M loss curve remain separate |
-| M3 | DDP 4-way + scaling efficiency table | 4 | ⬜ not started | M1, M2 |
+| M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization and deterministic replay checks passed; numerical reproducibility follow-up open | Document findings |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
 | M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
@@ -171,6 +171,18 @@ transferring at three-quarters of achievable bandwidth.
 > every DDP/FSDP explanation you'll give later. "DDP scaled to 3.6× of ideal at 4 GPUs, and the
 > gap is gradient all-reduce — which I know cost me X ms/step because I measured the bus at
 > Y GB/s" is a complete answer. Without this number you're guessing.
+
+### M0 B200 NCCL validation — 2026-11-04
+
+- **Hardware:** 4× NVIDIA B200, one node (`cl-worker36`), NV18 topology.
+- **Protocol:** FP32 all-reduce, 4 ranks, 1 MiB–2 GiB message sweep, 5 warmup and 20 timing iterations per message size.
+- **Prediction M0-B200-001:** peak algorithm bandwidth above the earlier A100 reference of 130.2 GB/s.
+- **Actual M0-B200-001:** peak algorithm bandwidth **434.0 GB/s**, ring-equivalent bus bandwidth **651.1 GB/s**, at 2 GiB; all-rank correctness passed.
+- **Prediction M0-B200-002:** repeat peak algorithm bandwidth within 10%.
+- **Actual M0-B200-002:** **433.6 GB/s** algorithm, **650.5 GB/s** bus; algorithm-bandwidth difference **−0.09%**.
+- **Interpretation:** bandwidth continued increasing through the largest tested message. The ring-equivalent bus-bandwidth metric is a convention, not a direct measurement of physical NVLink traffic. NCCL reported NVLS capability, but this alone does not establish which collective algorithm handled each size.
+- **Limit:** comparison with the earlier A100 result is cross-generation and uses different best message sizes; it is not a controlled hardware-only speedup.
+- **Artifacts:** `runs/M0-B200-001.json`, `runs/M0-B200-002.json`.
 
 ### M1 integration checks — 2026-10-31 (SMOKE ONLY; NOT performance baselines)
 
@@ -329,6 +341,44 @@ transferring at three-quarters of achievable bandwidth.
 - **Reproducibility:** original predictions were preserved. Successful runs verified the *executed* attention backend, not only the requested flag. First-step timings include first touch/autotuning and potentially cached compilation; don't treat them as pure compile latency.
 - **Close M1:** preserve **nine** JSON artifacts (M1-001…009), the original prediction record, updated documentation, compiler-cache launcher and native-compiler setup in Git; defer detailed bottleneck attribution and repeated confidence intervals to M7. **Next: M2 CPU data pipeline** (tokenize, dedup, quality-filter, pack, shard); release the 1-GPU pod once artifacts are verified/committed.
 
+### M3 B200 DDP scaling — 2026-11-04
+
+- **Hardware:** 1/2/4×B200 on `cl-worker36`, BF16, FlashAttention.
+- **Protocol:** per-GPU microbatch 16, sequence length 1024, gradient accumulation 1, synthetic on-device batches, 200 optimizer steps after step 0, 50 warmup steps and 150 measured steps. Window timing uses the maximum rank duration.
+- **Question:** how does GPT-125M versus GPT-1.3B weak-scale under eager versus compiled DDP?
+- **Efficiency:** aggregate N-GPU tokens/s divided by N times the matched M1 single-GPU tokens/s.
+- **Predictions:** recorded before each run and preserved verbatim in the linked JSON artifacts.
+
+| Run | Model | GPUs | Mode | Predicted tok/s | Actual tok/s | Efficiency | MFU | Peak GB/GPU |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| M3-001 | gpt-125m | 4 | Eager | 1.50–1.70M | 1,734,601 | 93.96% | 16.49% | 17.7 |
+| M3-002 | gpt-125m | 4 | Compiled | 2.40–2.60M | 2,438,818 | 88.97% | 23.18% | 12.8 |
+| M3-003 | gpt-1.3b | 4 | Eager | 310–345K | 335,788 | 92.16% | 31.61% | 62.8 |
+| M3-004 | gpt-1.3b | 4 | Compiled | 368–398K | 366,670 | 86.63% | 34.52% | 58.0 |
+| M3-005 | gpt-125m | 2 | Compiled | 1.26–1.34M | 1,190,023 | 86.83% | 22.62% | 12.8 |
+| M3-006 | gpt-1.3b | 2 | Compiled | 180–196K | 188,660 | 89.14% | 35.53% | 58.0 |
+| M3-007 | gpt-125m | 2 | Compiled | 1.20–1.23M | 1,222,981 | 89.23% | 23.25% | 12.8 |
+
+**Prediction versus observation**
+
+- M3-001, M3-002, M3-003, M3-006 and M3-007 landed inside their predicted throughput intervals.
+- M3-004 finished about 0.36% below its 368K tok/s lower prediction bound.
+- M3-005 finished about 5.6% below its 1.26M tok/s lower prediction bound. Its measured windows contained an early timing slowdown; M3-007 was a preregistered repeat.
+- M3-007 achieved 1.223M tok/s versus M3-005's 1.190M, approximately 2.77% higher, with substantially more stable timing windows.
+
+**Findings and limits**
+
+- Four-GPU weak-scaling efficiencies: **93.97%** (125M eager), **88.97%** (125M compiled), **92.16%** (1.3B eager), **86.63%** (1.3B compiled).
+- Compilation improved four-GPU throughput by approximately **40.6%** at 125M and **9.2%** at 1.3B, while lowering peak allocated memory for both.
+- The two-GPU 125M repeat achieved 89.23% efficiency, close to the four-GPU 88.97% result. The difference is too small to establish a scaling advantage.
+- These are **weak-scaling throughput measurements**, not fixed-global-batch strong scaling. All runs use repeated synthetic data; falling loss does not establish generalization.
+- The 125M loss curves differed considerably between nominally identical default-mode runs, despite matching seed/configuration/Git SHA. A separate two-rank parameter-sync probe returned zero maximum inter-rank difference after 20 steps.
+- Two deterministic replays using `torch.use_deterministic_algorithms(True)` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` matched all **15/15 logged loss values** to four decimals, but did not establish bitwise identity or isolate the original source of variation. An opt-in `--deterministic` flag was subsequently added in commit `a8e7b97`.
+- The original JSON records incorrectly report `warmup_steps_discarded=0` because the meter was constructed with `warmup=0`; the training loop did exclude the configured first **50** warmup steps from each official throughput result. Keep this metadata discrepancy visible until fixed.
+- No NCCL communication/computation overlap trace, clock analysis, or causal explanation of residual scaling loss is claimed; defer root-cause profiling to M7.
+
+**Artifacts:** `runs/M3-001.json` through `runs/M3-007.json`.
+
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
 - **Date / HW:** TBD · 4×B200 · precision is the only variable; everything else held fixed
@@ -454,6 +504,29 @@ that's the field that makes it a story.
 - **Generalizable lesson:** a model FLOPs formula is a reporting convention, not an instruction-level hardware counter. A term can be essential to the conventional estimator while still overcrediting work skipped by a specialized causal implementation. Review mathematical assumptions and source-code comments separately.
 - **Resolution:** documentation now discloses the limitation; the stale `ISSUE-004` code reference is updated to `ISSUE-005`, preserving ISSUE-004 for the separately verified backend-cache incident.
 
+
+### ISSUE-006 — TorchInductor failed to find a C compiler on the new B200 pod
+
+- **Date / HW:** 2026-11-04 · 4×B200 · PyTorch 2.8.0+cu128.
+- **Symptom:** compiled DDP failed on all four ranks with
+  `torch._inductor.exc.InductorError: RuntimeError: Failed to find C compiler`.
+- **Diagnosis:** eager DDP had succeeded, but `torch.compile` requires a native compiler for generated code. The persistent Python environment survived pod recreation; system-installed compiler packages did not.
+- **Fix:** install `build-essential` in the container. Existing `setup_env.sh` already checks for `gcc`, `g++` and `make`; run it on each new GPU pod instead of only sourcing the previously generated environment file.
+- **Validation:** compiled GPT-125M DDP smoke test passed, followed by successful M3-002 and M3-004 measured runs.
+- **Lesson:** a persistent Python environment does not imply persistent system dependencies. Verify native build tools whenever GPU containers are recreated.
+
+### ISSUE-007 — Compiled DDP loss trajectories differed between identical-seed runs
+
+- **Date / HW:** 2026-11-04 · 2×B200 · GPT-125M compiled/Flash/BF16.
+- **Symptom:** M3-005 and M3-007 used identical recorded configurations, seed 1337 and Git SHA `73e0292`, yet final losses were **7.4523** and **9.3490**.
+- **Synchronization check:** a separate 20-step four-rank compiled DDP probe measured maximum inter-rank parameter difference **0.000e+00**.
+- **Deterministic experiment:** two 200-step two-rank replays enabled `torch.use_deterministic_algorithms(True)` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`. All **15/15 logged loss values matched to four decimals**, including final loss **10.5975** in both runs.
+- **Interpretation:** deterministic configuration yielded reproducible logged trajectories in the tested setup. This supports numerical nondeterminism as a possible explanation for the earlier variation, but the exact operation or cause has **not** been isolated. No bitwise parameter-equivalence test was performed.
+- **Performance caveat:** replay throughputs differed (**1,004,079** vs **1,099,709 tok/s**), despite matching logged losses. Reproducibility of the training trajectory does not establish performance stability.
+- **Status:** mitigation validated; root-cause identification remains open.
+- **Lesson:** fixed random seeds, synchronized DDP parameters and deterministic numerical execution are distinct guarantees. Test them independently.
+
+
 ---
 
 ## 4. Decision Log
@@ -470,6 +543,17 @@ Non-obvious choices only. If the alternative was never plausible, don't log it.
 - **Because:** __
 - **What would change my mind:** __
 ```
+
+### DEC-009 — Keep deterministic execution optional
+
+- **Date:** 2026-11-04.
+- **Chose:** add an opt-in `--deterministic` flag to `train.py`, recording the mode in experiment configuration. Enable PyTorch deterministic algorithms and set a default `CUBLAS_WORKSPACE_CONFIG=:4096:8` when requested.
+- **Over:** enabling deterministic execution for every training benchmark, or leaving the reproducibility controls only in temporary diagnostic scripts.
+- **Because:** performance benchmarking and numerical reproducibility answer different questions. M3's original throughput measurements should retain their execution settings, while future correctness runs need an explicit, reproducible mode.
+- **Validation:** two deterministic replays matched all 15 logged losses; the committed flag passed a two-GPU compiled-DDP smoke test.
+- **Limit:** deterministic mode is not a guarantee of bitwise cross-system reproducibility and may alter performance. Its cuBLAS setting uses `setdefault`, so any existing environment override must be checked.
+- **Commit:** `a8e7b97`.
+- **What would change my mind:** evidence that deterministic execution has negligible cost for the representative workload and offers preferable reliability as the default.
 
 ### DEC-008 — How train.py measures: windowed sync, separate compile time, observed kernels
 
