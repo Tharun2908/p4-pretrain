@@ -125,15 +125,22 @@ class MemmapBatches:
 
 # ---- optimizer & schedule ----------------------------------------------------------------
 
-def build_optimizer(model: GPT, lr: float, weight_decay: float, device: str):
+def build_optimizer(model: GPT, lr: float, weight_decay: float, device: str,
+                    decay_param_ids: set[int] | None = None):
     """
     Weight decay on matrices only (dim >= 2: all Linear weights + the tied embedding).
     Biases and LayerNorm gains stay undecayed — decaying a LayerNorm gain toward zero
     fights the normalization it exists to undo. parameters() de-dups the tied tensor.
     fused=True: one kernel for the whole AdamW update instead of a loop over params.
     """
-    decay = [p for p in model.parameters() if p.dim() >= 2]
-    no_decay = [p for p in model.parameters() if p.dim() < 2]
+    params = list(model.parameters())
+    if decay_param_ids is None:
+        decay = [p for p in params if p.dim() >= 2]
+        no_decay = [p for p in params if p.dim() < 2]
+    else:
+        # FSDP may expose original parameter objects as 1D shards.
+        decay = [p for p in params if id(p) in decay_param_ids]
+        no_decay = [p for p in params if id(p) not in decay_param_ids]
     groups = [{"params": decay, "weight_decay": weight_decay},
               {"params": no_decay, "weight_decay": 0.0}]
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), eps=1e-8,
@@ -210,6 +217,8 @@ def parse_args(argv=None):
     p.add_argument("--model", default="gpt-125m", choices=sorted(ALL_MODELS))
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--strategy", choices=["ddp", "fsdp-grad", "fsdp-full"],
+                   default="ddp", help="Distributed training strategy")
     p.add_argument("--deterministic", action="store_true",
                    help="Enable deterministic PyTorch algorithms for reproducibility")
     p.add_argument("--backend", default="auto", choices=["auto", *BACKENDS],
@@ -250,6 +259,13 @@ def main(argv=None) -> dict:
         device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     on_cuda = device.startswith("cuda")
     cfg = ALL_MODELS[args.model]
+    if args.strategy != "ddp":
+        if world < 2 or not on_cuda:
+            raise SystemExit("FSDP requires at least two CUDA ranks for M4")
+        if args.compile:
+            raise SystemExit("FSDP + torch.compile not yet validated in M4")
+        if args.grad_accum != 1:
+            raise SystemExit("FSDP gradient accumulation not yet validated in M4")
 
     # steps are counted AFTER step 0, so windows end at log_every, 2·log_every, … steps
     if args.bench_warmup % args.log_every:
@@ -260,6 +276,7 @@ def main(argv=None) -> dict:
     tokens_per_step = args.micro_bs * args.grad_accum * cfg.block_size * world
     config = dict(model=cfg.name, n_params=cfg.n_params, world_size=world, device=device,
                   compile=args.compile, deterministic=args.deterministic,
+                  strategy=args.strategy,
                   backend=args.backend, data=args.data,
                   micro_bs=args.micro_bs, grad_accum=args.grad_accum,
                   block_size=cfg.block_size, tokens_per_step=tokens_per_step,
@@ -274,7 +291,11 @@ def main(argv=None) -> dict:
             raise SystemExit("measured runs need --run-id, --question and --prediction "
                              "(or pass --dry-run for a throwaway run)")
         rec = RunRecord(run_id=args.run_id, question=args.question, prediction=args.prediction,
-                        strategy="single" if world == 1 else "DDP",
+                        strategy=("single" if world == 1 else {
+                            "ddp": "DDP",
+                            "fsdp-grad": "FSDP-SHARD_GRAD_OP",
+                            "fsdp-full": "FSDP-FULL_SHARD",
+                        }[args.strategy]),
                         precision=config["precision"], config=config, notes=args.notes)
 
     torch.manual_seed(args.seed)                 # identical init on every rank
@@ -283,14 +304,62 @@ def main(argv=None) -> dict:
 
     model = GPT(cfg).to(device)
     raw_model = model
-    ddp_model = None
-    if world > 1:                                # unvalidated until M3
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        ddp_model = model = DDP(model, device_ids=[local_rank] if on_cuda else None)
-    if args.compile:
-        model = torch.compile(model)             # compile(DDP(m)): lets DDPOptimizer split at buckets
 
-    opt = build_optimizer(raw_model, args.lr, args.weight_decay, device)
+    # Capture identity and matrix classification BEFORE FSDP sharding.
+    original_param_ids = {id(p) for p in raw_model.parameters()}
+    decay_param_ids = {
+        id(p) for p in raw_model.parameters() if p.dim() >= 2
+    }
+
+    ddp_model = None
+    fsdp_model = None
+
+    if args.strategy == "ddp":
+        if world > 1:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            ddp_model = model = DDP(
+                model,
+                device_ids=[local_rank] if on_cuda else None,
+            )
+    else:
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
+        sharding = {
+            "fsdp-grad": ShardingStrategy.SHARD_GRAD_OP,
+            "fsdp-full": ShardingStrategy.FULL_SHARD,
+        }[args.strategy]
+
+        # Keep tied embedding/output weight in the ROOT owner.
+        for i, block in enumerate(raw_model.transformer.h):
+            raw_model.transformer.h[i] = FSDP(
+                block,
+                sharding_strategy=sharding,
+                use_orig_params=True,
+                device_id=local_rank,
+            )
+
+        fsdp_model = model = FSDP(
+            raw_model,
+            sharding_strategy=sharding,
+            use_orig_params=True,
+            device_id=local_rank,
+        )
+
+        if {id(p) for p in model.parameters()} != original_param_ids:
+            raise RuntimeError("FSDP changed original parameter identities")
+
+    if args.compile:
+        model = torch.compile(model)
+
+    # Optimizer is created AFTER FSDP wrapping, but retains the
+    # original weight-decay versus no-decay classification.
+    opt = build_optimizer(
+        raw_model, args.lr, args.weight_decay, device,
+        decay_param_ids=decay_param_ids if fsdp_model is not None else None,
+    )
 
     if args.data == "synthetic":
         batches = SyntheticBatches(args.micro_bs, cfg.block_size, device, seed=args.seed + rank)
@@ -333,7 +402,12 @@ def main(argv=None) -> dict:
             loss_acc += loss.detach()
             loss.backward()
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
+            if fsdp_model is not None:
+                fsdp_model.clip_grad_norm_(args.grad_clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    raw_model.parameters(), args.grad_clip
+                )
         opt.step()
         opt.zero_grad(set_to_none=True)
         return loss_acc
