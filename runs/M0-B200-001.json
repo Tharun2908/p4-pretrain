@@ -1,0 +1,99 @@
+{
+  "run_id": "M0-B200-001",
+  "milestone": "M0",
+  "question": "Do 4 ranks initialize, is all-reduce correct, and what bandwidth does the PyTorch/NCCL stack actually deliver?",
+  "prediction": "Expect large-message algorithm bandwidth above the A100 reference of 130.2 GB/s if B200 NVLink/NVSwitch transport is active; verify NVLS and measure the complete bandwidth curve",
+  "strategy": "allreduce-bench",
+  "precision": "fp32",
+  "config": {
+    "world_size": 4,
+    "dtype": "fp32",
+    "timing": "max across ranks",
+    "warmup": 5,
+    "iters": 20
+  },
+  "env": {
+    "node": "cl-worker36",
+    "hostname": "ml-training-b200-4gpu",
+    "python": "3.11.17",
+    "torch": "2.8.0+cu128",
+    "gpu_name": "NVIDIA B200",
+    "gpu_count_visible": 4,
+    "cuda": "12.8",
+    "nccl": "2.27.3",
+    "git_sha": "73e0292",
+    "git_dirty": false,
+    "git_dirty_files": [],
+    "NCCL_DEBUG": "INFO",
+    "OMP_NUM_THREADS": "1"
+  },
+  "metrics": {
+    "peak_busbw_GBps": 651.1,
+    "peak_algbw_GBps": 434.0,
+    "sweep": [
+      {
+        "bytes": 1048576,
+        "algbw_GBps": 51.9,
+        "busbw_GBps": 77.9
+      },
+      {
+        "bytes": 2097152,
+        "algbw_GBps": 86.7,
+        "busbw_GBps": 130.0
+      },
+      {
+        "bytes": 4194304,
+        "algbw_GBps": 118.4,
+        "busbw_GBps": 177.5
+      },
+      {
+        "bytes": 8388608,
+        "algbw_GBps": 179.5,
+        "busbw_GBps": 269.2
+      },
+      {
+        "bytes": 16777216,
+        "algbw_GBps": 241.5,
+        "busbw_GBps": 362.2
+      },
+      {
+        "bytes": 33554432,
+        "algbw_GBps": 282.7,
+        "busbw_GBps": 424.1
+      },
+      {
+        "bytes": 67108864,
+        "algbw_GBps": 359.4,
+        "busbw_GBps": 539.2
+      },
+      {
+        "bytes": 134217728,
+        "algbw_GBps": 380.4,
+        "busbw_GBps": 570.6
+      },
+      {
+        "bytes": 268435456,
+        "algbw_GBps": 394.0,
+        "busbw_GBps": 591.0
+      },
+      {
+        "bytes": 536870912,
+        "algbw_GBps": 409.2,
+        "busbw_GBps": 613.8
+      },
+      {
+        "bytes": 1073741824,
+        "algbw_GBps": 424.9,
+        "busbw_GBps": 637.3
+      },
+      {
+        "bytes": 2147483648,
+        "algbw_GBps": 434.0,
+        "busbw_GBps": 651.1
+      }
+    ],
+    "contention_processes": []
+  },
+  "outcome": "Strong intra-node collective bandwidth, consistent with NVLink/NVSwitch. Proceed to M1.",
+  "started_at": "2026-11-04T19:08:55"
+}
