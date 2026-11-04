@@ -169,6 +169,7 @@ class ThroughputMeter:
         self.peak_flops = peak_flops * world_size   # aggregate peak across the job
         self.peak_label = peak_label                # e.g. "B200/fp8 = 4.5e+15 FLOPS dense"
         self.world_size = world_size
+        self.peak_mem_override_gb = None
         self.warmup = warmup
         self.n_steps = 0
         self.tokens = 0
@@ -211,6 +212,8 @@ class ThroughputMeter:
 
     @property
     def peak_mem_gb(self) -> float:
+        if self.peak_mem_override_gb is not None:
+            return self.peak_mem_override_gb
         if torch is None or not torch.cuda.is_available():
             return 0.0
         return torch.cuda.max_memory_allocated() / 1e9

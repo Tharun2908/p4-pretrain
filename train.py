@@ -348,6 +348,7 @@ def main(argv=None) -> dict:
 
     # ---- main loop: windowed timing ------------------------------------------------------
     first_loss = loss.item()
+    mem_per_rank_gb = []
     sync(); t_last = time.perf_counter()
     for step in range(1, args.steps + 1):
         loss = train_step(step)
@@ -356,8 +357,39 @@ def main(argv=None) -> dict:
             dt = time.perf_counter() - t_last
             lv = loss
             if world > 1:
+                # Distributed throughput is limited by the slowest rank.
+                # Reduce timing before logging, outside the measured window.
+                elapsed = torch.tensor(
+                    dt, dtype=torch.float64, device=device
+                )
+                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+                dt = elapsed.item()
+
+                # Report mean loss across all ranks.
                 dist.all_reduce(lv, op=dist.ReduceOp.AVG)
             lv = lv.item()
+
+            # Memory reporting is outside the measured window.
+            if on_cuda:
+                local_mem = torch.tensor(
+                    [torch.cuda.max_memory_allocated() / 1e9],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                if world > 1:
+                    gathered = [
+                        torch.zeros_like(local_mem)
+                        for _ in range(world)
+                    ]
+                    dist.all_gather(gathered, local_mem)
+                    mem_per_rank_gb = [
+                        round(x.item(), 3) for x in gathered
+                    ]
+                else:
+                    mem_per_rank_gb = [round(local_mem.item(), 3)]
+
+                meter.peak_mem_override_gb = max(mem_per_rank_gb)
+
             if step > args.bench_warmup:
                 meter.record_window(tokens_per_step * args.log_every, args.log_every, dt, lv)
                 say(meter.report())
@@ -365,10 +397,14 @@ def main(argv=None) -> dict:
                 say(f"step {step:>6} | warmup (not measured) | {dt/args.log_every*1e3:.1f} ms/step | loss {lv:.4f}")
             # GPU is idle after the sync: .item(), the DDP loss all-reduce and printing are
             # reporting overhead, not training. Start the next window AFTER them.
+            if world > 1:
+                # Align the next window; exclude reporting/barrier time.
+                dist.barrier()
             t_last = time.perf_counter()
 
     extra = {"compile_s": round(compile_s, 2), "first_loss": first_loss,
-             "attn_kernels_observed": kernels}
+             "attn_kernels_observed": kernels,
+             "peak_mem_gb_per_rank": mem_per_rank_gb if on_cuda else None}
     out = {**meter.as_dict(), **extra}
     if rec is not None:
         rec.finish(meter, notes=args.notes, outdir=args.outdir, extra=extra)

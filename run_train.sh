@@ -1,42 +1,82 @@
 #!/usr/bin/env bash
-# P4 training launcher. Use this for compiled runs instead of `python train.py`.
-# Chooses a per-backend Inductor cache before the Python process imports torch.
-# Examples:
-#   bash run_train.sh --model gpt-tiny --steps 40 --compile --backend cudnn --dry-run
-#   bash run_train.sh --model gpt-125m --steps 200 --backend flash --compile ...
-# Noncompiled runs are also supported; all arguments pass through to train.py.
+# P4 training launcher:
+#   Single process: bash run_train.sh --model gpt-tiny --dry-run ...
+#   Distributed:    bash run_train.sh --nproc-per-node 4 --model gpt-125m ...
+#
+# --nproc-per-node belongs to this launcher, not train.py.
+# Other arguments pass through unchanged.
 
 set -euo pipefail
 source /workspace/p4/p4env.sh
 
 backend=auto
 compiled=0
-args=("$@")
-for ((i=0; i<${#args[@]}; i++)); do
-  case "${args[i]}" in
-    --compile) compiled=1 ;;
-    --backend)
-      if (( i+1 >= ${#args[@]} )); then
-        echo "ERROR: --backend requires a value" >&2
+nproc=""
+args=()
+
+while (( $# > 0 )); do
+  case "$1" in
+    --nproc-per-node|--nproc_per_node)
+      if (( $# < 2 )); then
+        echo "ERROR: --nproc-per-node needs a value" >&2
         exit 2
       fi
-      backend="${args[i+1]}"
-      ((i+=1))
+      nproc="$2"
+      shift 2
       ;;
-    --backend=*) backend="${args[i]#--backend=}" ;;
+    --nproc-per-node=*|--nproc_per_node=*)
+      nproc="${1#*=}"
+      shift
+      ;;
+    --compile)
+      compiled=1
+      args+=("$1")
+      shift
+      ;;
+    --backend)
+      if (( $# < 2 )); then
+        echo "ERROR: --backend needs a value" >&2
+        exit 2
+      fi
+      backend="$2"
+      args+=("$1" "$2")
+      shift 2
+      ;;
+    --backend=*)
+      backend="${1#*=}"
+      args+=("$1")
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
   esac
 done
 
 case "$backend" in
-  flash|cudnn|efficient|math|auto) ;;
-  *) echo "ERROR: unsupported attention backend: $backend" >&2; exit 2 ;;
+  auto|flash|cudnn|efficient|math) ;;
+  *)
+    echo "ERROR: unsupported backend: $backend" >&2
+    exit 2
+    ;;
 esac
 
+if [[ -n "$nproc" ]] && ! [[ "$nproc" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: --nproc-per-node must be a positive integer" >&2
+  exit 2
+fi
+
 if (( compiled )); then
-  # Use a fresh process for each run; Inductor reads this variable during import.
-  # Explicitly isolate caches so a compiled Flash graph is never reused for cuDNN.
   export TORCHINDUCTOR_CACHE_DIR="${P4_INDUCTOR_CACHE_ROOT:-/workspace/.cache/p4-inductor}/$backend"
   mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
-  echo "[p4] torch.compile backend=$backend; cache=$TORCHINDUCTOR_CACHE_DIR"
+  echo "[p4] compile backend=$backend cache=$TORCHINDUCTOR_CACHE_DIR"
 fi
-exec python train.py "$@"
+
+if [[ -n "$nproc" ]]; then
+  echo "[p4] launching torchrun with $nproc processes"
+  exec torchrun --standalone --nproc_per_node="$nproc" train.py "${args[@]}"
+else
+  echo "[p4] launching single-process training"
+  exec python train.py "${args[@]}"
+fi
