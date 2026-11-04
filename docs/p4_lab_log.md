@@ -58,7 +58,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
 | M2 | Data pipeline (ingest→filter→exact/near dedup→group split→tokenize→shard) | **0** (CPU) | ✅ M2-001…006 implemented and committed; ✅ M2-007 500-doc real-data pilot audited; ⬜ final CPU training smoke / M2-007 commit pending | Larger real corpus + clean 125M loss curve remain separate |
 | M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization and deterministic replay checks passed; numerical reproducibility follow-up open | Document findings |
-| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ⬜ not started | M3 |
+| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | 🟡 ZeRO-2/3 benchmarks completed at both sizes; ZeRO-1 pending | M3 |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
 | M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
@@ -378,6 +378,74 @@ transferring at three-quarters of achievable bandwidth.
 - No NCCL communication/computation overlap trace, clock analysis, or causal explanation of residual scaling loss is claimed; defer root-cause profiling to M7.
 
 **Artifacts:** `runs/M3-001.json` through `runs/M3-007.json`.
+
+### M4 B200 FSDP sharding — 2026-11-04
+
+- **Hardware/protocol:** 4×B200, eager BF16, FlashAttention, synthetic
+  on-device batches, microbatch 16/GPU, sequence length 1024,
+  gradient accumulation 1, 200 training steps, 50 excluded warmup
+  steps, 150 measured steps.
+- **Implementation:** nested PyTorch FSDP with
+  `SHARD_GRAD_OP` (ZeRO-2-like) and `FULL_SHARD` (ZeRO-3-like),
+  `use_orig_params=True`, tied embedding/head weights owned by the
+  root FSDP unit, fused AdamW, and FSDP-aware gradient clipping.
+- **Correctness:** both sharding strategies passed three-step
+  FP32/SGD parameter-update parity against DDP (maximum observed
+  difference 0.000e+00), BF16/Flash/AdamW execution tests, optimizer
+  parameter-group checks, and GPT-125M/1.3B smoke tests.
+
+| Run | Model | Strategy | Throughput (tok/s) | Peak GB/GPU | MFU |
+|---|---|---|---:|---:|---:|
+| M3-001 | 125M | DDP eager baseline | 1,734,601 | 17.68 | 16.49% |
+| M4-001 | 125M | ZeRO-2 initial | 1,380,219 | 16.6 | 13.12% |
+| M4-002 | 125M | ZeRO-3 | 1,553,383 | 16.3 | 14.76% |
+| M4-003 | 125M | ZeRO-2 repeat | 1,641,148 | 16.6 | 15.60% |
+| M3-003 | 1.3B | DDP eager baseline | 335,788 | 62.8 | 31.61% |
+| M4-004 | 1.3B | ZeRO-2 | 342,653 | 51.0 | 32.26% |
+| M4-005 | 1.3B | ZeRO-3 | 340,166 | 46.3 | 32.03% |
+
+**Prediction versus observation**
+
+- M4-001: throughput and memory predictions met, but severe slow
+  measured windows reduced cumulative throughput.
+- M4-002: memory prediction met; throughput exceeded the upper
+  predicted bound of 1.50M tok/s.
+- M4-003: repeat throughput and memory predictions met; throughput
+  improved by 18.9% over M4-001.
+- M4-004: memory prediction met; throughput exceeded the upper
+  predicted bound of 335K tok/s.
+- M4-005: throughput and memory predictions met.
+
+**Findings**
+
+- At 125M, peak memory fell from 17.68 GB/GPU under DDP to 16.6
+  with ZeRO-2 and 16.3 with ZeRO-3: approximately 6.1% and 7.8%
+  savings.
+- At 1.3B, peak memory fell from 62.8 GB/GPU under DDP to 51.0
+  with ZeRO-2 and 46.3 with ZeRO-3: approximately 18.8% and
+  26.3% savings.
+- At 1.3B, ZeRO-3 measured 340,166 tok/s versus DDP's 335,788;
+  this 1.3% difference is too small to establish an intrinsic
+  throughput advantage without repeated controlled measurements.
+- ZeRO-2 at 125M varied from 1.380M to 1.641M tok/s between two
+  nominally identical runs. The underlying cause of the slow timing
+  windows was not isolated.
+- Loss trajectories varied across runs and strategies despite
+  matching seeds/settings. BF16/AdamW parameter-update parity and
+  deterministic multi-run reproducibility remain unverified.
+- Measurements report PyTorch peak *allocated* GPU memory, not
+  reserved memory or total device usage. Synthetic repeated-token
+  training does not establish generalization.
+- Comparisons use **eager DDP** baselines, not compiled DDP.
+  The JSON warmup metadata issue described in M3 remains; actual
+  timing excludes the first 50 training steps.
+
+**Artifacts:** `runs/M4-001.json` through `runs/M4-005.json`.
+
+**Remaining scope:** ZeRO-1 implementation/measurement, possible
+repeat runs and reproducibility investigation, then M4 synthesis.
+
+---
 
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
