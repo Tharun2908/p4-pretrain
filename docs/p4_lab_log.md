@@ -820,6 +820,59 @@ Non-obvious choices only. If the alternative was never plausible, don't log it.
 - **Only thing the env can't control:** the node's NVIDIA driver (must be ≥ 570 for CUDA 12.8 /
   Blackwell). `setup_env.sh` prints it on every run.
 
+### DEC-010 — B200 NVLink and host-NUMA topology
+
+- **Date:** 2026-11-05
+- **Hardware:** `cl-worker36`, 4× NVIDIA B200.
+- **Evidence:** `nvidia-smi topo -m`, GPU PCI identifiers,
+  and `lscpu` output collected inside the four-GPU pod.
+
+**Observed GPU topology**
+
+Every GPU pair reports `NV18` connectivity.
+
+| GPU | PCI bus ID | Host NUMA | Nearest NIC (PXB) |
+|---|---|---:|---|
+| 0 | `00000000:1B:00.0` | 0 | `mlx5_4` |
+| 1 | `00000000:52:00.0` | 0 | `mlx5_8` |
+| 2 | `00000000:61:00.0` | 0 | `mlx5_9` |
+| 3 | `00000000:C3:00.0` | 1 | `mlx5_13` |
+
+NUMA 0 CPU affinity: `0-55,112-167`.
+NUMA 1 CPU affinity: `56-111,168-223`.
+
+**Decision**
+
+Retain the M5 TP groups `(0,1)` and `(2,3)`.
+
+- `(0,1)` shares host NUMA 0.
+- `(2,3)` spans host NUMA 0 and NUMA 1.
+- Both pairs report NV18 connectivity.
+- With three GPUs in NUMA 0 and one in NUMA 1,
+  no complete two-pair grouping can keep both
+  groups within individual host NUMA domains.
+
+**Reasoning**
+
+Host-NUMA placement and GPU-to-GPU NVLink connectivity
+are different aspects of system topology. The fact
+that GPUs 2 and 3 have different host NUMA affinities
+does not establish that their GPU collectives traverse
+the CPU interconnect.
+
+No measured host-NUMA performance penalty is claimed.
+The existing M5 benchmarks remain valid observations
+of the tested configuration.
+
+**Future work**
+
+If CPU-to-GPU transfers or dataloader overhead become
+performance bottlenecks, investigate NUMA-local memory
+allocation and CPU pinning as controlled experiments.
+
+This decision supplements the historical A100-specific
+DEC-004; it does not replace its original observations.
+
 ### DEC-004 — TP group placement on the A100 node: (0,1) and (2,3), for host reasons only
 
 - **Date:** 2026-08-01
