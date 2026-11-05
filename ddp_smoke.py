@@ -217,7 +217,15 @@ def main() -> None:
                        "timing": "max across ranks", "warmup": 5, "iters": 20},
             # Same snapshot every RunRecord gets: node (downward API), git SHA, versions.
             # Infra runs aren't blocked on a dirty tree, but dirtiness is still recorded.
-            "env": {**_env_snapshot(), "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "")},
+            "env": {
+                **_env_snapshot(),
+                "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", ""),
+                "NCCL_DEBUG_SUBSYS": os.environ.get("NCCL_DEBUG_SUBSYS", ""),
+                "NCCL_ALGO": os.environ.get("NCCL_ALGO", "<unset:auto>"),
+                "NCCL_NVLS_ENABLE": os.environ.get(
+                    "NCCL_NVLS_ENABLE", "<unset:default>"
+                ),
+            },
             "metrics": {
                 "peak_busbw_GBps": round(peak, 1),
                 "peak_algbw_GBps": round(peak_alg, 1),
