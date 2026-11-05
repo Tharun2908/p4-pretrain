@@ -127,7 +127,8 @@ class MemmapBatches:
 # ---- optimizer & schedule ----------------------------------------------------------------
 
 def build_optimizer(model: GPT, lr: float, weight_decay: float, device: str,
-                    decay_param_ids: set[int] | None = None):
+                    decay_param_ids: set[int] | None = None,
+                    fused: bool | None = None):
     """
     Weight decay on matrices only (dim >= 2: all Linear weights + the tied embedding).
     Biases and LayerNorm gains stay undecayed — decaying a LayerNorm gain toward zero
@@ -145,7 +146,9 @@ def build_optimizer(model: GPT, lr: float, weight_decay: float, device: str,
     groups = [{"params": decay, "weight_decay": weight_decay},
               {"params": no_decay, "weight_decay": 0.0}]
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), eps=1e-8,
-                             fused=device.startswith("cuda"))
+                             fused=(device.startswith("cuda")
+                                    if fused is None else fused),
+                             foreach=(False if fused is False else None))
 
 
 def lr_at(step: int, max_lr: float, warmup: int, total: int, min_ratio: float = 0.1) -> float:
@@ -218,7 +221,7 @@ def parse_args(argv=None):
     p.add_argument("--model", default="gpt-125m", choices=sorted(ALL_MODELS))
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--compile", action="store_true")
-    p.add_argument("--strategy", choices=["ddp", "zero1", "fsdp-grad", "fsdp-full"],
+    p.add_argument("--strategy", choices=["ddp", "zero1", "fsdp-grad", "fsdp-full", "tp", "tp-dp"],
                    default="ddp", help="Distributed training strategy")
     p.add_argument("--deterministic", action="store_true",
                    help="Enable deterministic PyTorch algorithms for reproducibility")
@@ -240,6 +243,14 @@ def parse_args(argv=None):
     p.add_argument("--run-id")
     p.add_argument("--question")
     p.add_argument("--prediction")
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Directory for TP/TP-DP distributed checkpoints")
+    p.add_argument("--save-every", type=int, default=0,
+                   help="Checkpoint interval in completed steps")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from checkpoint-dir/latest.json")
+    p.add_argument("--stop-after", type=int, default=None,
+                   help="Diagnostic: stop after this checkpointed step")
     p.add_argument("--outdir", default="runs")
     p.add_argument("--notes", default="")
     return p.parse_args(argv)
@@ -268,13 +279,67 @@ def main(argv=None) -> dict:
         if args.grad_accum != 1:
             raise SystemExit("Sharded strategy gradient accumulation not yet validated in M4")
 
+    if args.strategy == "tp" and world != 2:
+        raise SystemExit("M5 TP requires exactly 2 CUDA ranks")
+    if args.strategy == "tp-dp" and world != 4:
+        raise SystemExit("M5 TP-DP requires exactly 4 CUDA ranks")
+
+    checkpoint_requested = (
+        args.checkpoint_dir is not None
+        or args.save_every != 0
+        or args.resume
+        or args.stop_after is not None
+    )
+
+    if checkpoint_requested:
+        if args.strategy not in ("tp", "tp-dp"):
+            raise SystemExit("M5 checkpointing supports TP/TP-DP only")
+        if not args.dry_run:
+            raise SystemExit(
+                "M5 checkpoint integration currently requires --dry-run"
+            )
+        if args.data != "synthetic":
+            raise SystemExit(
+                "M5 checkpointing currently supports synthetic data only"
+            )
+        if args.compile:
+            raise SystemExit(
+                "M5 checkpointing with --compile is not validated"
+            )
+        if not args.checkpoint_dir or args.save_every <= 0:
+            raise SystemExit(
+                "Specify --checkpoint-dir and positive --save-every"
+            )
+        if args.save_every % args.log_every != 0:
+            raise SystemExit(
+                "--save-every must be a multiple of --log-every"
+            )
+        if args.stop_after is not None:
+            if args.resume:
+                raise SystemExit(
+                    "Do not combine --resume with --stop-after"
+                )
+            if not (
+                1 <= args.stop_after < args.steps
+                and args.stop_after % args.save_every == 0
+            ):
+                raise SystemExit(
+                    "--stop-after must be a checkpoint step "
+                    "before the final step"
+                )
+
     # steps are counted AFTER step 0, so windows end at log_every, 2·log_every, … steps
     if args.bench_warmup % args.log_every:
         raise SystemExit("--bench-warmup must be a multiple of --log-every")
     if args.steps < args.bench_warmup + args.log_every:
         raise SystemExit("--steps must cover --bench-warmup plus at least one measured window")
 
-    tokens_per_step = args.micro_bs * args.grad_accum * cfg.block_size * world
+    dp_size = (
+        world // 2 if args.strategy in ("tp", "tp-dp") else world
+    )
+    tokens_per_step = (
+        args.micro_bs * args.grad_accum * cfg.block_size * dp_size
+    )
     config = dict(model=cfg.name, n_params=cfg.n_params, world_size=world, device=device,
                   compile=args.compile, deterministic=args.deterministic,
                   strategy=args.strategy,
@@ -284,6 +349,13 @@ def main(argv=None) -> dict:
                   steps=args.steps, bench_warmup=args.bench_warmup, log_every=args.log_every,
                   lr=args.lr, weight_decay=args.weight_decay, grad_clip=args.grad_clip,
                   precision="bf16" if on_cuda else "fp32", seed=args.seed)
+
+    if args.strategy in ("tp", "tp-dp"):
+        config.update(
+            tp_size=2,
+            dp_size=dp_size,
+            optimizer_impl="adamw_single_tensor",
+        )
 
     # ---- record FIRST: guards fire before any GPU time is spent --------------------------
     rec = None
@@ -297,6 +369,8 @@ def main(argv=None) -> dict:
                              "zero1": "ZeRO-1",
                             "fsdp-grad": "FSDP-SHARD_GRAD_OP",
                             "fsdp-full": "FSDP-FULL_SHARD",
+                            "tp": "TP-2",
+                            "tp-dp": "TP-2xDP-2",
                         }[args.strategy]),
                         precision=config["precision"], config=config, notes=args.notes)
 
@@ -315,6 +389,9 @@ def main(argv=None) -> dict:
 
     ddp_model = None
     fsdp_model = None
+    tp_model = None
+    tp_mesh = None
+    dp_mesh = None
 
     if args.strategy in ("ddp", "zero1"):
         if world > 1:
@@ -323,6 +400,27 @@ def main(argv=None) -> dict:
                 model,
                 device_ids=[local_rank] if on_cuda else None,
             )
+    elif args.strategy in ("tp", "tp-dp"):
+        from torch.distributed.device_mesh import init_device_mesh
+        from tp_parallel import (
+            parallelize_gpt_tp,
+            clip_grad_norm_tp_,
+            sync_dp_grads_,
+        )
+
+        if args.strategy == "tp-dp":
+            mesh = init_device_mesh(
+                "cuda",
+                (2, 2),
+                mesh_dim_names=("dp", "tp"),
+            )
+            dp_mesh = mesh["dp"]
+            tp_mesh = mesh["tp"]
+        else:
+            tp_mesh = init_device_mesh("cuda", (2,))
+
+        tp_model = model = parallelize_gpt_tp(raw_model, tp_mesh)
+
     else:
         from torch.distributed.fsdp import (
             FullyShardedDataParallel as FSDP,
@@ -380,12 +478,18 @@ def main(argv=None) -> dict:
         opt = build_optimizer(
             raw_model, args.lr, args.weight_decay, device,
             decay_param_ids=decay_param_ids if fsdp_model is not None else None,
+            fused=False if tp_model is not None else None,
         )
 
+    data_rank = (
+        dp_mesh.get_local_rank() if dp_mesh is not None
+        else (0 if tp_model is not None else rank)
+    )
+
     if args.data == "synthetic":
-        batches = SyntheticBatches(args.micro_bs, cfg.block_size, device, seed=args.seed + rank)
+        batches = SyntheticBatches(args.micro_bs, cfg.block_size, device, seed=args.seed + data_rank)
     else:
-        batches = MemmapBatches(args.data, args.micro_bs, cfg.block_size, device, seed=args.seed + rank)
+        batches = MemmapBatches(args.data, args.micro_bs, cfg.block_size, device, seed=args.seed + data_rank)
 
     if on_cuda:
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -422,9 +526,15 @@ def main(argv=None) -> dict:
             loss = loss / args.grad_accum
             loss_acc += loss.detach()
             loss.backward()
+
+        if dp_mesh is not None:
+            sync_dp_grads_(raw_model, dp_mesh)
+
         if args.grad_clip > 0:
             if fsdp_model is not None:
                 fsdp_model.clip_grad_norm_(args.grad_clip)
+            elif tp_model is not None:
+                clip_grad_norm_tp_(raw_model, args.grad_clip, tp_mesh=tp_mesh)
             else:
                 torch.nn.utils.clip_grad_norm_(
                     raw_model.parameters(), args.grad_clip
@@ -436,23 +546,80 @@ def main(argv=None) -> dict:
     say(f"[train] {cfg.name} ({cfg.n_params/1e6:.0f}M) · {device} · world {world} · "
         f"compile={args.compile} · backend={args.backend} · {tokens_per_step:,} tok/step")
 
-    # ---- step 0: compile + first-touch costs, timed on their own -------------------------
-    sync(); t0 = time.perf_counter()
-    loss = train_step(0)
-    sync(); compile_s = time.perf_counter() - t0
-    say(f"[train] step 0 (incl. compile/autotune): {compile_s:.1f}s · loss {loss.item():.4f}")
+    # ---- initialization or checkpoint resume --------------------------------
+    if args.checkpoint_dir:
+        from tp_checkpoint import (
+            save_tp_checkpoint,
+            load_tp_checkpoint,
+        )
 
-    kernels = observe_attention_kernels(model, batches, fwd_ctx) if on_cuda else []
-    if kernels:
-        say(f"[train] attention kernels observed: {kernels}")
-    if on_cuda:
-        verify_backend(args.backend, kernels)       # fails here, before any measured window
+    if args.resume:
+        completed_step = load_tp_checkpoint(
+            args.checkpoint_dir,
+            raw_model,
+            opt,
+            batches,
+            args,
+            cfg,
+            world,
+            device,
+        )
 
-    # ---- main loop: windowed timing ------------------------------------------------------
-    first_loss = loss.item()
+        if completed_step >= args.steps:
+            raise RuntimeError(
+                "Checkpoint already reached the configured final step"
+            )
+
+        start_step = completed_step + 1
+
+        # Step 0 and the profiler were already executed before
+        # the checkpoint. Repeating either changes the training
+        # trajectory or consumes extra batches.
+        compile_s = None
+        first_loss = None
+        kernels = []
+
+        say(
+            f"[train] resumed after step {completed_step}; "
+            f"next step {start_step}",
+            flush=True,
+        )
+
+    else:
+        # Original startup: step 0 + attention-kernel verification.
+        sync()
+        t0 = time.perf_counter()
+
+        loss = train_step(0)
+
+        sync()
+        compile_s = time.perf_counter() - t0
+
+        say(
+            f"[train] step 0 (incl. compile/autotune): "
+            f"{compile_s:.1f}s · loss {loss.item():.4f}"
+        )
+
+        kernels = (
+            observe_attention_kernels(model, batches, fwd_ctx)
+            if on_cuda else []
+        )
+
+        if kernels:
+            say(f"[train] attention kernels observed: {kernels}")
+
+        if on_cuda:
+            verify_backend(args.backend, kernels)
+
+        first_loss = loss.item()
+        start_step = 1
+
+    # ---- main loop: windowed timing ----------------------------------------
     mem_per_rank_gb = []
-    sync(); t_last = time.perf_counter()
-    for step in range(1, args.steps + 1):
+    sync()
+    t_last = time.perf_counter()
+
+    for step in range(start_step, args.steps + 1):
         loss = train_step(step)
         if step % args.log_every == 0:
             sync()
@@ -494,7 +661,13 @@ def main(argv=None) -> dict:
 
             if step > args.bench_warmup:
                 meter.record_window(tokens_per_step * args.log_every, args.log_every, dt, lv)
-                say(meter.report())
+
+                # Display the global training step, not the number of
+                # measured steps since this process started.
+                report = meter.report()
+                measured_prefix = f"step {meter.n_steps:>6} |"
+                assert report.startswith(measured_prefix)
+                say(f"step {step:>6} |" + report[len(measured_prefix):])
             else:
                 say(f"step {step:>6} | warmup (not measured) | {dt/args.log_every*1e3:.1f} ms/step | loss {lv:.4f}")
             # GPU is idle after the sync: .item(), the DDP loss all-reduce and printing are
@@ -502,9 +675,35 @@ def main(argv=None) -> dict:
             if world > 1:
                 # Align the next window; exclude reporting/barrier time.
                 dist.barrier()
+
+            # Save outside the timed window. All ranks participate.
+            if (
+                args.checkpoint_dir
+                and step % args.save_every == 0
+            ):
+                save_tp_checkpoint(
+                    args.checkpoint_dir,
+                    step,
+                    raw_model,
+                    opt,
+                    batches,
+                    args,
+                    cfg,
+                    world,
+                    device,
+                )
+
+            # Exclude checkpoint I/O from the next timing window.
             t_last = time.perf_counter()
 
-    extra = {"compile_s": round(compile_s, 2), "first_loss": first_loss,
+            if args.stop_after == step:
+                say(
+                    f"[M5 CKPT] controlled stop after step {step}",
+                    flush=True,
+                )
+                break
+
+    extra = {"compile_s": (round(compile_s, 2) if compile_s is not None else None), "first_loss": first_loss,
              "attn_kernels_observed": kernels,
              "peak_mem_gb_per_rank": mem_per_rank_gb if on_cuda else None}
     out = {**meter.as_dict(), **extra}

@@ -1010,3 +1010,254 @@ The tokenization and sharding manifests independently reported matching **total 
 4. For a meaningful clean GPT-125M from-scratch loss curve, scale to an appropriately sized reproducible real-text dataset, monitor PVC/cache usage, record dedup/quality statistics and validation-token coverage, then reserve a GPU. Keep this objective separate from upcoming M3 4-GPU communication/scaling comparisons.
 
 **Decision for M3:** M2's pilot validates the data-path format and audit workflow, but is **not** a prerequisite to keep enlarging the corpus before coding/debugging DDP. Do not confuse pipeline completeness with the much larger training-data budget required for model-quality experiments.
+
+
+## 8. M5 — Tensor Parallelism and Hybrid TP × DP
+
+### 8.1 Objective and experimental scope
+
+**Objective:** Implement tensor parallelism for the P4 GPT architecture,
+combine it with data parallelism, verify numerical correctness, and
+evaluate the performance and recovery tradeoffs.
+
+**Hardware:** Single-node NVIDIA B200-SXM GPUs.
+
+**Software:** PyTorch 2.8.0, CUDA-enabled runtime, NCCL 2.27.3,
+BF16 autocast, and FlashAttention.
+
+Two distributed configurations were validated:
+
+| Strategy | World size | Parallelism |
+|---|---:|---|
+| TP | 2 | TP=2 |
+| Hybrid | 4 | TP=2 × DP=2 |
+
+The hybrid device mesh is organized as DP × TP.
+
+- TP groups: [0,1], [2,3]
+- DP groups: [0,2], [1,3]
+
+The milestone prioritizes correctness before communication optimization.
+
+### 8.2 M5-001 — Tensor-parallel implementation
+
+**Implementation:** `tp_parallel.py`, integrated into `train.py`.
+
+The attention and MLP projections are distributed as follows:
+
+| Projection | Parallelization |
+|---|---|
+| Attention fused QKV | Column-wise |
+| Attention output | Row-wise |
+| MLP expansion | Column-wise |
+| MLP output | Row-wise |
+
+Embeddings, LayerNorms, and the LM head remain replicated.
+The input embedding and LM head continue sharing their weight.
+
+The fused QKV projection requires rank-major reordering before
+column-wise sharding. Without this reordering, a TP rank would not
+receive the intended local Q, K, and V partitions.
+
+The standalone TP implementation passed forward, loss, backward,
+and parameter-gradient parity tests against the reference GPT.
+
+**GPT-tiny reference comparison:**
+
+| Measurement | Observed |
+|---|---:|
+| Maximum logits difference | 2.384e-07 |
+| Loss difference | 0 |
+| Maximum parameter-gradient difference | 1.788e-07 |
+| Tied embeddings | Preserved |
+
+GPT-1.3B full-model parity was also validated:
+
+- Maximum logits difference: approximately 1.168e-05
+- Loss difference: approximately 9.537e-07
+- Maximum parameter-gradient difference: approximately 1.136e-06
+
+These results establish numerical parity within the measured
+floating-point tolerances, not bitwise identity.
+
+### 8.3 M5-002 — Hybrid TP × DP correctness
+
+**Implementation:** `sync_dp_grads_()` and
+`clip_grad_norm_tp_()` in `tp_parallel.py`.
+
+Each TP group receives identical training examples, while different
+DP replicas receive different examples.
+
+Corresponding local parameter gradients are averaged across DP ranks
+after backward propagation.
+
+Global clipping sums squared gradients from unique TP shards and
+counts replicated gradients only once per TP group.
+
+**Hybrid gradient reference test:**
+
+| Measurement | Observed |
+|---|---:|
+| Global batch | 4 |
+| Sequence length | 8 |
+| Reference loss | 10.83638573 |
+| Hybrid loss | 10.83638573 |
+| Parameters checked | 28 |
+| Maximum gradient difference | 2.533e-07 |
+
+**Hybrid optimizer reference test:**
+
+Three FP32 update steps passed with DP gradient averaging, global
+gradient clipping, and standard AdamW.
+
+- Maximum gradient-norm difference: 1.350e-07
+- Maximum parameter difference: 3.822e-06
+
+BF16 FlashAttention training also passed with standard AdamW,
+gradient clipping, and decreasing loss across three steps.
+
+**Interpretation:** The hybrid implementation matches the reference
+training computation within numerical tolerance for the tested
+architecture, data, and optimizer settings.
+
+### 8.4 M5-003 — Distributed checkpointing and recovery
+
+**Implementation:** `tp_checkpoint.py`.
+
+PyTorch Distributed Checkpoint saves model and optimizer state.
+Additional per-rank runtime files preserve:
+
+- Completed global training step
+- Synthetic-data cursor
+- CPU RNG state
+- CUDA RNG state
+
+A saved configuration signature is verified before resumption.
+
+The `latest.json` marker is published after successful checkpoint
+writes, using atomic file replacement.
+
+**Verified recovery experiments:**
+
+1. Distributed checkpoint roundtrip.
+2. Fresh-process restart with restored optimizer and runtime state.
+3. Interrupted versus uninterrupted training comparison.
+4. Worker SIGKILL followed by restart from the last published step.
+5. Collective reporting of checkpoint directory creation errors.
+6. Collective reporting of rank-local runtime write errors.
+7. Collective preflight rejection of unreadable runtime state.
+8. Quarantine of a newer incomplete checkpoint directory.
+9. Rejection of automatic quarantine when `latest.json` is absent.
+
+The uninterrupted and resumed training experiments matched exactly
+for compared model and optimizer tensors, data cursors, and CPU/CUDA
+RNG states.
+
+The checkpoint comparison covered 112 state tensors per rank in the
+tested hybrid GPT-tiny configuration.
+
+**Recovery boundary:** These guarantees were tested for synthetic
+training with a matching topology and configuration. They are not
+claims of arbitrary-topology checkpoint portability or recovery from
+every possible collective failure.
+
+### 8.5 M5-004 — Preliminary performance observations
+
+GPT-1.3B diagnostic measurements on B200 GPUs:
+
+| Strategy | GPUs | Global tokens/step | Approx. tokens/s |
+|---|---:|---:|---:|
+| DDP | 2 | 16,384 | 148,200 |
+| TP=2 | 2 | 16,384 | 82,500 |
+| DDP | 4 | 32,768 | 289,500 |
+| TP=2 × DP=2 | 4 | 32,768 | 145,900 |
+
+**Observed:** At these settings, DDP delivered approximately
+1.8× the throughput of standalone TP on two GPUs and approximately
+2.0× that of hybrid TP × DP on four GPUs.
+
+**Interpretation limits:**
+
+- Per-rank microbatch sizes differed.
+- DDP used fused AdamW.
+- TP and hybrid used single-tensor AdamW.
+- Hybrid DP synchronization currently performs one all-reduce per
+  parameter rather than bucketed collectives.
+- TP introduces additional inter-GPU communication.
+
+These comparisons are preliminary diagnostics, not a controlled
+isolation of TP communication overhead.
+
+The low MFU numbers from short GPT-tiny checkpoint smoke tests
+are not meaningful production performance measurements.
+
+### 8.6 Decisions, negative results, and limitations
+
+**Decision 1 — Preserve earlier optimizer behavior.**
+
+Restrict standard single-tensor AdamW to TP and hybrid modes.
+Retain the existing optimizer selection for DDP, ZeRO-1, and FSDP.
+
+**Decision 2 — Keep TP degree fixed at 2.**
+
+The current architecture and correctness tests validate TP=2.
+Larger TP degrees require separate validation.
+
+**Decision 3 — Prioritize correctness over communication tuning.**
+
+Retain explicit per-parameter DP gradient averaging for the M5
+baseline. Bucketed reductions are a future optimization.
+
+**Negative result — Fused and foreach AdamW.**
+
+The tested fused and foreach AdamW paths failed with the current
+mixture of DTensors and ordinary tensors. This is a limitation of
+the tested implementation and software configuration, not evidence
+that fused optimization is universally incompatible with TP.
+
+**Current restrictions:**
+
+- TP=2, or TP=2 × DP=2.
+- TP gradient accumulation restricted to 1.
+- TP with `torch.compile` not validated.
+- Checkpoint integration restricted to synthetic-data dry runs.
+- Checkpoint resumption requires matching configuration and topology.
+- Concurrent checkpoint writers are unsupported.
+
+### 8.7 Regression evidence and next actions
+
+During the M5 review, the ordinary repository suite passed:
+
+**94 passed, 0 failures.**
+
+Distributed validation was executed separately using `torchrun`.
+The relocated GPT-tiny TP parity, BF16 training, hybrid gradient
+parity, and hybrid optimizer parity tests passed.
+
+The checkpoint implementation was additionally tested against
+simulated filesystem failures and controlled restart scenarios.
+
+**Repository locations:**
+
+- `tp_parallel.py`
+- `tp_checkpoint.py`
+- `train.py`
+- `tests/distributed/`
+- `experiments/m5/`
+- `docs/m5_tensor_parallel.md`
+
+**Next actions:**
+
+1. Run the final regression sweep after M5 cleanup.
+2. Review the staged Git diff and exclude generated checkpoint data.
+3. Commit and push the validated M5 implementation.
+4. Collect clean-tree benchmark records with documented experimental
+   configurations and appropriately long measurement windows.
+5. Keep additional communication optimizations separate from the
+   correctness baseline.
+
+**M5 conclusion:** TP and hybrid TP × DP have passed the reported
+reference-model correctness checks. Restartable DCP checkpointing
+has passed controlled recovery and failure-injection experiments.
+The current throughput comparisons demonstrate a performance
+tradeoff, but do not isolate its individual causes.

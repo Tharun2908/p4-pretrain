@@ -13,3 +13,10 @@ logs/*.log
 logs/*.json.gz
 
 # runs/*.json and plots/*.png are deliberately NOT ignored: they are the evidence
+
+# M5 local distributed-checkpoint artifacts
+logs/*_ckpt/
+logs/m5_train_*_probe/
+
+# Backups created during integration
+logs/*.bak
