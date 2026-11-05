@@ -501,6 +501,96 @@ differences should not be interpreted as definitive strategy rankings.
 
 ---
 
+
+### RUN M5-DDP2-001 — DDP versus TP on two B200 GPUs
+
+- **Date / HW:** 2026-11-05; 2x NVIDIA B200-SXM.
+- **Code:** `b1d1583`; PyTorch 2.8.0; BF16; FlashAttention.
+- **Config:** GPT-1.3B; DDP=2; micro_bs=8; sequence=1024;
+  global tokens/step=16,384; fused AdamW; grad_clip=0.1.
+- **Protocol:** 120 steps; 30 warmup; 90 measured;
+  10-step timing windows.
+- **Question:** How does DDP=2 compare with TP=2 at matched
+  global tokens per optimizer step?
+- **Prediction:** DDP=2 would outperform TP=2 under the
+  current optimizer and communication implementations.
+- **Actual:** 148,011 tok/s; 27.87% MFU; 43.2 GB peak/GPU;
+  p50=110.7 ms; p95=110.9 ms.
+- **Gap vs prediction:** Direction confirmed; DDP was 1.83x
+  faster than the measured TP=2 configuration.
+  The original prediction specified no numeric throughput.
+- **Decision / next:** Compare against TP=2 with the same
+  global tokens/step; retain optimizer differences as a caveat.
+- **Artifacts:** `runs/M5-DDP2-001.json`.
+
+### RUN M5-TP2-001 — Tensor parallelism on two B200 GPUs
+
+- **Date / HW:** 2026-11-05; 2x NVIDIA B200-SXM.
+- **Code:** `b1d1583`; PyTorch 2.8.0; BF16; FlashAttention.
+- **Config:** GPT-1.3B; TP=2; micro_bs=16 per TP group;
+  sequence=1024; global tokens/step=16,384;
+  single-tensor AdamW; grad_clip=0.1.
+- **Protocol:** 120 steps; 30 warmup; 90 measured;
+  10-step timing windows.
+- **Question:** How does TP=2 compare with DDP=2 at matched
+  global tokens per optimizer step?
+- **Prediction:** Approximately 82,000 tok/s, below DDP=2.
+- **Actual:** 80,806 tok/s; 15.22% MFU; 39.4 GB peak/GPU;
+  p50=202.3 ms; p95=204.3 ms.
+- **Gap vs prediction:** 1,194 tok/s below prediction
+  (approximately -1.46%).
+- **Decision / next:** TP saved 3.8 GB peak memory per GPU,
+  but throughput was substantially lower. Do not attribute
+  the full difference to communication alone.
+- **Artifacts:** `runs/M5-TP2-001.json`.
+
+### RUN M5-DDP4-001 — Four-GPU data-parallel baseline
+
+- **Date / HW:** 2026-11-05; 4x NVIDIA B200-SXM.
+- **Code:** `b1d1583`; PyTorch 2.8.0; BF16; FlashAttention.
+- **Config:** GPT-1.3B; DDP=4; micro_bs=8 per rank;
+  sequence=1024; global tokens/step=32,768;
+  fused AdamW; grad_clip=0.1.
+- **Protocol:** 120 steps; 30 warmup; 90 measured;
+  10-step timing windows.
+- **Question:** How does DDP=4 compare with hybrid TP=2 x
+  DP=2 at matched global tokens per step?
+- **Prediction:** Approximately 290,000 tok/s, with DDP
+  outperforming hybrid.
+- **Actual:** 288,584 tok/s; 27.17% MFU; 43.2 GB peak/GPU;
+  p50=113.5 ms; p95=113.8 ms.
+- **Gap vs prediction:** 1,416 tok/s below prediction
+  (approximately -0.49%).
+- **Decision / next:** DDP scaled 1.95x relative to the
+  DDP=2 run at fixed per-rank microbatch size.
+- **Artifacts:** `runs/M5-DDP4-001.json`.
+
+### RUN M5-HYBRID-001 — Hybrid TP=2 x DP=2
+
+- **Date / HW:** 2026-11-05; 4x NVIDIA B200-SXM.
+- **Code:** `b1d1583`; PyTorch 2.8.0; BF16; FlashAttention.
+- **Config:** GPT-1.3B; TP=2 x DP=2;
+  micro_bs=16 per TP group; sequence=1024;
+  global tokens/step=32,768;
+  single-tensor AdamW; grad_clip=0.1.
+- **Protocol:** 120 steps; 30 warmup; 90 measured;
+  10-step timing windows.
+- **Question:** How does hybrid TP x DP compare with DDP=4
+  at matched global tokens per step?
+- **Prediction:** Approximately 145,000 tok/s, below DDP=4.
+- **Actual:** 148,641 tok/s; 13.99% MFU;
+  39.4 GB peak/GPU; p50=213.2 ms; p95=260.1 ms.
+- **Gap vs prediction:** 3,641 tok/s above prediction
+  (approximately +2.51%).
+- **Observation:** Cumulative throughput reached
+  153,244 tok/s at step 100 and declined to
+  148,641 tok/s by step 120.
+- **Decision / next:** DDP=4 was 1.94x faster while
+  hybrid used 3.8 GB less peak memory per GPU.
+  Investigate throughput variability only in a separate,
+  controlled follow-up experiment.
+- **Artifacts:** `runs/M5-HYBRID-001.json`.
+
 ## 3. Issue Log
 
 Anything that broke and cost >20 minutes. Fill the root cause in even after you've moved on —
@@ -1161,35 +1251,68 @@ training with a matching topology and configuration. They are not
 claims of arbitrary-topology checkpoint portability or recovery from
 every possible collective failure.
 
-### 8.5 M5-004 — Preliminary performance observations
+### 8.5 M5-004 — Official performance benchmarks
 
-GPT-1.3B diagnostic measurements on B200 GPUs:
+**Date:** 2026-11-05.
 
-| Strategy | GPUs | Global tokens/step | Approx. tokens/s |
-|---|---:|---:|---:|
-| DDP | 2 | 16,384 | 148,200 |
-| TP=2 | 2 | 16,384 | 82,500 |
-| DDP | 4 | 32,768 | 289,500 |
-| TP=2 × DP=2 | 4 | 32,768 | 145,900 |
+**Code:** `b1d1583`, clean working tree at benchmark launch.
 
-**Observed:** At these settings, DDP delivered approximately
-1.8× the throughput of standalone TP on two GPUs and approximately
-2.0× that of hybrid TP × DP on four GPUs.
+**Hardware:** Single-node NVIDIA B200-SXM GPUs.
 
-**Interpretation limits:**
+**Protocol:** GPT-1.3B, BF16 autocast, FlashAttention,
+sequence length 1024, synthetic data, seed 1337,
+gradient accumulation 1, gradient clipping 0.1,
+120 steps with 30 warmup and 90 measured steps.
 
-- Per-rank microbatch sizes differed.
-- DDP used fused AdamW.
-- TP and hybrid used single-tensor AdamW.
-- Hybrid DP synchronization currently performs one all-reduce per
-  parameter rather than bucketed collectives.
-- TP introduces additional inter-GPU communication.
+| Strategy | GPUs | Tokens/step | Tokens/s | MFU | Peak GB/GPU |
+|---|---:|---:|---:|---:|---:|
+| DDP=2 | 2 | 16,384 | 148,011 | 27.87% | 43.2 |
+| TP=2 | 2 | 16,384 | 80,806 | 15.22% | 39.4 |
+| DDP=4 | 4 | 32,768 | 288,584 | 27.17% | 43.2 |
+| TP=2 x DP=2 | 4 | 32,768 | 148,641 | 13.99% | 39.4 |
 
-These comparisons are preliminary diagnostics, not a controlled
-isolation of TP communication overhead.
+**Measured comparison:**
 
-The low MFU numbers from short GPT-tiny checkpoint smoke tests
-are not meaningful production performance measurements.
+- On two GPUs, DDP throughput was approximately 1.83x TP.
+- On four GPUs, DDP throughput was approximately 1.94x
+  the hybrid strategy.
+- TP/hybrid used 3.8 GB less peak memory per GPU.
+- DDP throughput increased approximately 1.95x from
+  two to four GPUs at the same per-rank microbatch size.
+
+**Step-time p50 / p95:**
+
+- DDP=2: 110.7 / 110.9 ms
+- TP=2: 202.3 / 204.3 ms
+- DDP=4: 113.5 / 113.8 ms
+- Hybrid: 213.2 / 260.1 ms
+
+Step-time percentiles are calculated from averages of
+10-step measurement windows, not individual GPU steps.
+
+**Prediction assessment:**
+
+- DDP=2: predicted to outperform TP=2; confirmed.
+- TP=2: predicted 82,000; actual 80,806 tok/s (-1.46%).
+- DDP=4: predicted 290,000; actual 288,584 tok/s (-0.49%).
+- Hybrid: predicted 145,000; actual 148,641 tok/s (+2.51%).
+
+**Variability:** Hybrid cumulative throughput declined from
+153,244 tok/s at step 100 to 148,641 tok/s at step 120.
+The available logs do not identify the cause.
+
+**Interpretation boundary:** The comparison evaluates the
+implemented systems, not isolated TP communication overhead.
+DDP used fused AdamW while TP/hybrid used single-tensor
+AdamW. Microbatch configurations and communication patterns
+also differed.
+
+**Official artifacts:**
+
+- `runs/M5-DDP2-001.json`
+- `runs/M5-TP2-001.json`
+- `runs/M5-DDP4-001.json`
+- `runs/M5-HYBRID-001.json`
 
 ### 8.6 Decisions, negative results, and limitations
 
@@ -1251,8 +1374,8 @@ simulated filesystem failures and controlled restart scenarios.
 1. Run the final regression sweep after M5 cleanup.
 2. Review the staged Git diff and exclude generated checkpoint data.
 3. Commit and push the validated M5 implementation.
-4. Collect clean-tree benchmark records with documented experimental
-   configurations and appropriately long measurement windows.
+4. Completed: four clean-tree benchmark records collected on
+   2026-11-05 and preserved under `runs/M5-*.json`.
 5. Keep additional communication optimizations separate from the
    correctness baseline.
 
