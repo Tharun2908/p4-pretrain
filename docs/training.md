@@ -1,6 +1,42 @@
 # P4 Training Systems — Benchmark Results
 
-> **Project status (2026-10-31):** M1 completed on 1×NVIDIA B200. M0 has a historical 4×A100 interconnect baseline; **4×B200 NCCL rerun and M2–M7 training systems work remain pending**. This document is a growing results report, not a claim of completed distributed training.
+> **Project status (2026-11-05):** M0-B200 interconnect validation, M1 single-GPU benchmarks, M3 DDP scaling, M4 ZeRO/FSDP comparisons, and M5 tensor/hybrid parallelism benchmarks are complete. M2 data-pipeline work is documented in the lab log. M6–M8 remain future work. This report describes measured results, not a claim of production-scale pretraining.
+
+## M0-B200 — Interconnect validation
+
+On 2026-11-04, four B200 GPUs on `cl-worker36` passed a
+four-rank FP32 NCCL all-reduce correctness test. The topology
+reported `NV18` between GPU pairs.
+
+The benchmark swept message sizes from 1 MiB to 2 GiB,
+using five warmup iterations and 20 measured iterations
+per size.
+
+| Run | Peak algorithm bandwidth | Ring-equivalent bus bandwidth | Best size |
+|---|---:|---:|---:|
+| M0-B200-001 | 434.0 GB/s | 651.1 GB/s | 2 GiB |
+| M0-B200-002 | 433.6 GB/s | 650.5 GB/s | 2 GiB |
+
+The repeat differed by approximately 0.09% in peak
+algorithm bandwidth. Bandwidth continued increasing
+through the largest tested message.
+
+**Prediction quality:** The original M0-B200-001 prediction
+only specified bandwidth above the historical A100
+130.2 GB/s reference. This was too broad to be a useful
+quantitative performance forecast. The original prediction
+is preserved in the JSON record, not rewritten after
+observing the result.
+
+**NVLS limitation:** NCCL reported NVLS capability, but
+the available evidence does not establish which algorithm
+handled each message size. Ring-equivalent bus bandwidth
+is a reporting convention, not a direct measurement of
+physical NVLink traffic. A controlled algorithm comparison
+remains a follow-up experiment.
+
+**Artifacts:** `runs/M0-B200-001.json`,
+`runs/M0-B200-002.json`.
 
 ## M1 — Single-GPU BF16 baseline
 
@@ -102,11 +138,135 @@ python bench.py --summarize runs/
 
 For future repetitions, use `bash run_train.sh ... --compile --backend flash` (or `cudnn`) to set a **separate Inductor cache directory before Python starts**; keep profiler backend verification enabled. `setup_env.sh` checks and, on supported root GPU pods, installs native compiler tools if absent, while preserving the locked Python environment on the PVC.
 
-## Remaining milestones
+## M3 — B200 DDP scaling
 
-- **M0-B200:** rerun NCCL bandwidth on the 4×B200 node before distributed runs (historical 4×A100 M0-001 is not directly transferable).
-- **M2:** CPU data pipeline (tokenization, deduplication, quality filtering, packing, sharding), followed by a meaningful real-data loss curve at 125M.
-- **M3–M5:** 4-GPU DDP; FSDP/ZeRO memory/communication tradeoffs; 2-way tensor parallelism and checkpoint/resume.
-- **M6:** controlled BF16/FP8/FP4 precision investigation.
-- **M7:** operator-level bottleneck diagnosis, repeatability, and a measured optimization ablation.
-- **M8:** finalize README, figures, and system narrative when subsequent results exist.
+Seven official runs measured GPT-125M and GPT-1.3B
+under eager or compiled BF16 DDP on one, two, and
+four B200 GPUs.
+
+The weak-scaling protocol kept microbatch 16 per GPU,
+sequence length 1024, gradient accumulation 1,
+synthetic on-device data, and 150 measured steps
+after 50 excluded warmup steps.
+
+| Run | Model | GPUs | Mode | Tokens/s | Weak-scaling efficiency |
+|---|---|---:|---|---:|---:|
+| M3-001 | 125M | 4 | Eager | 1,734,601 | 93.96% |
+| M3-002 | 125M | 4 | Compiled | 2,438,818 | 88.97% |
+| M3-003 | 1.3B | 4 | Eager | 335,788 | 92.16% |
+| M3-004 | 1.3B | 4 | Compiled | 366,670 | 86.63% |
+| M3-005 | 125M | 2 | Compiled | 1,190,023 | 86.83% |
+| M3-006 | 1.3B | 2 | Compiled | 188,660 | 89.14% |
+| M3-007 | 125M | 2 | Compiled repeat | 1,222,981 | 89.23% |
+
+Efficiency is aggregate throughput divided by GPU count
+times the matched M1 single-GPU throughput.
+
+**Findings:** Four-GPU efficiency ranged from
+86.63% to 93.96% across the tested configurations.
+At four GPUs, compilation improved GPT-125M throughput
+by approximately 40.6% and GPT-1.3B throughput
+by approximately 9.2%.
+
+The M3-005 repeat exhibited timing variability;
+M3-007 achieved approximately 2.77% higher throughput.
+Separate deterministic replay tests improved loss
+reproducibility, but the original source of variation
+was not conclusively isolated.
+
+These are weak-scaling measurements with increasing
+global batch size, not fixed-global-batch strong scaling.
+No causal communication-overhead attribution is claimed.
+
+**Artifacts:** `runs/M3-001.json` through
+`runs/M3-007.json`.
+
+## M4 — ZeRO and FSDP memory tradeoffs
+
+Four-B200 eager BF16 runs compared DDP with ZeRO-1,
+ZeRO-2-like FSDP `SHARD_GRAD_OP`, and ZeRO-3-like
+FSDP `FULL_SHARD`, using synthetic on-device data.
+
+Each measured run used 50 discarded warmup steps
+and 150 measured steps.
+
+| Model | Strategy | Run | Tokens/s | Peak GB/GPU |
+|---|---|---|---:|---:|
+| 125M | DDP baseline | M3-001 | 1,734,601 | 17.68 |
+| 125M | ZeRO-1 | M4-006 | 1,583,664 | 17.0 |
+| 125M | ZeRO-2 repeat | M4-003 | 1,641,148 | 16.6 |
+| 125M | ZeRO-3 | M4-002 | 1,553,383 | 16.3 |
+| 1.3B | DDP baseline | M3-003 | 335,788 | 62.8 |
+| 1.3B | ZeRO-1 | M4-007 | 330,372 | 54.9 |
+| 1.3B | ZeRO-2 | M4-004 | 342,653 | 51.0 |
+| 1.3B | ZeRO-3 | M4-005 | 340,166 | 46.3 |
+
+At GPT-1.3B, ZeRO-3 reduced peak allocated memory by
+approximately 26.3% compared with DDP. ZeRO-2 reduced
+it by approximately 18.8%, and ZeRO-1 by 12.6%.
+
+The ZeRO-2 GPT-125M initial run, `M4-001`, delivered
+1,380,219 tokens/s, while the repeated `M4-003`
+delivered 1,641,148 tokens/s. The substantial difference
+warns against treating small throughput differences
+between sharding strategies as definitive.
+
+Correctness tests covered optimizer and parameter-update
+parity, sharding, and BF16 training execution. Complete
+BF16/AdamW numerical reproducibility across all
+strategies remains outside the verified scope.
+
+**Artifacts:** `runs/M4-001.json` through
+`runs/M4-007.json`.
+
+## M5 — Tensor and hybrid parallelism
+
+Four official runs benchmarked GPT-1.3B on B200 GPUs
+under eager BF16 FlashAttention, sequence length 1024,
+gradient clipping 0.1, synthetic data, and 90 measured
+steps after 30 excluded warmup steps.
+
+| Run | Strategy | GPUs | Tokens/step | Tokens/s | MFU | Peak GB/GPU |
+|---|---|---:|---:|---:|---:|---:|
+| M5-DDP2-001 | DDP=2 | 2 | 16,384 | 148,011 | 27.87% | 43.2 |
+| M5-TP2-001 | TP=2 | 2 | 16,384 | 80,806 | 15.22% | 39.4 |
+| M5-DDP4-001 | DDP=4 | 4 | 32,768 | 288,584 | 27.17% | 43.2 |
+| M5-HYBRID-001 | TP=2 x DP=2 | 4 | 32,768 | 148,641 | 13.99% | 39.4 |
+
+At matched tokens per step, DDP delivered approximately
+1.83x TP throughput on two GPUs and 1.94x hybrid
+throughput on four GPUs. TP/hybrid used approximately
+3.8 GB less peak allocated memory per GPU.
+
+These differences are not isolated TP communication
+costs: DDP used fused AdamW while TP/hybrid used
+single-tensor AdamW, and microbatch/communication
+implementations also differed.
+
+Distributed correctness, checkpoint-resume, and
+crash-recovery tests passed. See
+[`m5_tensor_parallel.md`](m5_tensor_parallel.md)
+for implementation details and reproducibility limits.
+
+**Artifacts:** `runs/M5-DDP2-001.json`,
+`runs/M5-TP2-001.json`, `runs/M5-DDP4-001.json`,
+`runs/M5-HYBRID-001.json`.
+
+## Measurement provenance and remaining work
+
+- **M0-B200, M1, M3, M4, M5:** Benchmarks recorded
+  and linked to their original JSON artifacts.
+- **M2:** CPU data-pipeline implementation and evidence
+  are documented in `p4_lab_log.md`, Section 7.
+- **Historical correction (2026-11-05):** Commit
+  `884955d` corrected `warmup_steps_discarded` metadata
+  in 27 M1/M3/M4/M5 JSON records. Each contains an
+  explicit correction annotation. Original metric values
+  were preserved; this was not a benchmark rerun.
+- **M6:** Controlled BF16/FP8/FP4 investigation.
+- **M7:** Operator-level profiling, controlled optimization
+  experiments, and repeatability analysis.
+- **M8:** Final traceability review, README, figures,
+  and consolidated technical narrative.
+- **Remaining infrastructure checks:** B200 topology/NUMA
+  documentation and an NCCL algorithm-selection experiment.

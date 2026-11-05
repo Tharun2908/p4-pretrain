@@ -57,12 +57,12 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M0 | Env + NCCL sanity | 1 → 4 | ✅ B200 4-rank NCCL verified; 651.1 GB/s peak ring-equivalent bus bandwidth; repeat confirmed | — |
 | M1 | Single-GPU baseline + MFU, 125M **and** 1.3B, eager vs compiled | **1** | ✅ 33 B200 tests; M1-001…005 controlled baselines + M1-006…009 batch sweep complete; backend-cache regression passed | — |
 | M2 | Data pipeline (ingest→filter→exact/near dedup→group split→tokenize→shard) | **0** (CPU) | ✅ M2-001…006 implemented and committed; ✅ M2-007 500-doc real-data pilot audited; ⬜ final CPU training smoke / M2-007 commit pending | Larger real corpus + clean 125M loss curve remain separate |
-| M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization and deterministic replay checks passed; numerical reproducibility follow-up open | Document findings |
-| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ✅ Core ZeRO-1/2/3 benchmarks completed at both sizes; follow-ups documented | M3 |
-| M5 | 2-way TP **at 1.3B** + checkpoint/resume | 4 (logic: 1) | ⬜ not started | M4 |
+| M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization, deterministic replay checks, and results documentation completed | — |
+| M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ✅ Core ZeRO-1/2/3 benchmarks completed at both sizes; follow-ups documented | — |
+| M5 | 2-way TP **at 1.3B** + checkpoint/resume | 2 / 4 | ✅ TP and hybrid correctness, checkpoint recovery, benchmarks, and documentation committed | — |
 | M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
-| M8 | `docs/training.md` + README + writeup | 0 | 🟡 M1 results section drafted; final writeup pending | M4, M7 |
+| M8 | `docs/training.md` + README + writeup | 0 | 🟡 M0/M1/M3/M4/M5 results consolidated; final M6/M7 integration and writeup pending | M6, M7 |
 
 **Never cut:** M3, M4, M7, one clean from-scratch loss curve (125M), one diagnosed instability.
 
@@ -374,7 +374,7 @@ transferring at three-quarters of achievable bandwidth.
 - These are **weak-scaling throughput measurements**, not fixed-global-batch strong scaling. All runs use repeated synthetic data; falling loss does not establish generalization.
 - The 125M loss curves differed considerably between nominally identical default-mode runs, despite matching seed/configuration/Git SHA. A separate two-rank parameter-sync probe returned zero maximum inter-rank difference after 20 steps.
 - Two deterministic replays using `torch.use_deterministic_algorithms(True)` and `CUBLAS_WORKSPACE_CONFIG=:4096:8` matched all **15/15 logged loss values** to four decimals, but did not establish bitwise identity or isolate the original source of variation. An opt-in `--deterministic` flag was subsequently added in commit `a8e7b97`.
-- The original JSON records incorrectly report `warmup_steps_discarded=0` because the meter was constructed with `warmup=0`; the training loop did exclude the configured first **50** warmup steps from each official throughput result. Keep this metadata discrepancy visible until fixed.
+- **Metadata audit (2026-11-05):** The original JSON records reported `warmup_steps_discarded=0` even though the training loop excluded the first **50** warmup steps. Commit `884955d` corrected the recorded metadata with explicit audit annotations. Throughput and other measurement values were preserved.
 - No NCCL communication/computation overlap trace, clock analysis, or causal explanation of residual scaling loss is claimed; defer root-cause profiling to M7.
 
 **Artifacts:** `runs/M3-001.json` through `runs/M3-007.json`.
@@ -456,8 +456,8 @@ transferring at three-quarters of achievable bandwidth.
   reserved memory or total device usage. Synthetic repeated-token
   training does not establish generalization.
 - Comparisons use **eager DDP** baselines, not compiled DDP.
-  The JSON warmup metadata issue described in M3 remains; actual
-  timing excludes the first 50 training steps.
+  The original warmup metadata discrepancy was corrected in commit
+  `884955d`; measured throughput values were unchanged.
 
 **Artifacts:** `runs/M4-001.json` through `runs/M4-007.json`.
 
@@ -1371,13 +1371,16 @@ simulated filesystem failures and controlled restart scenarios.
 
 **Next actions:**
 
-1. Run the final regression sweep after M5 cleanup.
-2. Review the staged Git diff and exclude generated checkpoint data.
-3. Commit and push the validated M5 implementation.
-4. Completed: four clean-tree benchmark records collected on
-   2026-11-05 and preserved under `runs/M5-*.json`.
-5. Keep additional communication optimizations separate from the
-   correctness baseline.
+1. **Completed:** M5 regression suite passed (94 tests during
+   the original M5 review).
+2. **Completed:** Generated checkpoint artifacts were excluded from Git.
+3. **Completed:** M5 implementation committed as `b1d1583`.
+4. **Completed:** Four official clean-tree benchmark records collected
+   on 2026-11-05 and committed as `56d8ffa`.
+5. **Completed:** Historical warmup metadata corrected in `884955d`;
+   the expanded regression suite passed 95 tests.
+6. **Deferred:** Further communication and optimizer optimizations
+   remain separate from the verified M5 baseline.
 
 **M5 conclusion:** TP and hybrid TP × DP have passed the reported
 reference-model correctness checks. Restartable DCP checkpointing
