@@ -60,7 +60,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization, deterministic replay checks, and results documentation completed | — |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ✅ Core ZeRO-1/2/3 benchmarks completed at both sizes; follow-ups documented | — |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 2 / 4 | ✅ TP and hybrid correctness, checkpoint recovery, benchmarks, and documentation committed | — |
-| M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | ⬜ not started | M1 |
+| M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | 🟡 Single-GPU benchmarks and profiling completed; four-GPU confirmation pending | Four-GPU precision validation and real-data convergence |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
 | M8 | `docs/training.md` + README + writeup | 0 | 🟡 M0/M1/M3/M4/M5 results consolidated; final M6/M7 integration and writeup pending | M6, M7 |
 
@@ -539,7 +539,7 @@ differences should not be interpreted as definitive strategy rankings.
 
 ### RUN M6-001/002/003 — bf16 vs fp8 vs fp4 on B200 (PREDICTION LOGGED EARLY, run is weeks out)
 
-- **Date / HW:** TBD · 4×B200 · precision is the only variable; everything else held fixed
+- **Execution:** 2026-11-05 · single NVIDIA B200 · GPT-125M and GPT-1.3B · matched architecture, batch, seed and training protocol. Precision implementation differs by mode.
 - **Question:** what does descending precision actually buy on a 125M model, and where does it stop?
 - **PREDICTION (written 2026-08-01, before any hardware access):**
   - fp8 vs bf16: **1.2–1.5× throughput, not 2×.** Peak doubles, but only the matmuls move to fp8 —
@@ -551,9 +551,38 @@ differences should not be interpreted as definitive strategy rankings.
   - **MFU-vs-own-peak will DECREASE monotonically** across bf16 → fp8 → fp4, because the
     denominator doubles each step while the numerator doesn't. This is the expected shape,
     not a regression.
-- **Actual:** _fill in_
-- **Gap vs prediction:** _fill in_
-- **Decision / next:** _fill in_
+- **Actual:**
+  - GPT-125M: native BF16 **414,542**, TE BF16 **424,734**,
+    FP8 **371,908**, NVFP4 **272,374** tokens/s.
+  - GPT-1.3B: native BF16 **81,962**, TE BF16 **82,366**,
+    FP8 **90,204–91,070**, NVFP4 **85,931–89,739** tokens/s.
+  - All runs used one B200, micro-batch 8, sequence length
+    1024, 20 warmup and 80 measured steps.
+  - FP8 and NVFP4 MFU were deliberately not reported:
+    an all-FP8 or all-FP4 peak denominator would misrepresent
+    the mixed-precision model.
+  - Detailed results: `docs/m6_results.md`.
+- **Gap vs prediction:**
+  - Original FP8 hypothesis: 1.2–1.5x versus BF16.
+    At 125M, FP8/TE-BF16 was **0.876x**;
+    at 1.3B it was **1.095–1.106x**.
+    Neither model achieved the originally predicted speedup.
+  - Original NVFP4 hypothesis: approximately 1.1–1.2x
+    versus FP8. At 125M it achieved **0.732x**.
+    At 1.3B, NVFP4 remained slower than both recorded
+    FP8 runs, although the gap narrowed substantially.
+  - The prediction that lower-precision performance would
+    improve with model size was supported.
+  - The original MFU-ordering prediction could not be
+    evaluated with defensible mixed-precision MFU estimates.
+- **Decision / next:** Retain all benchmark records,
+  including timing disturbances. Complete four-GPU
+  precision correctness and scaling checks separately.
+  Longer real-data training is required before making
+  convergence or model-quality claims.
+- **Artifacts:** `docs/m6_results.md`,
+  `docs/m6_smoke_results.md`, and 10 committed
+  `runs/M6-*.json` records.
 
 - **ADDENDUM 2026-10-15 (DEC-006, written before any B200 run):** M6 now runs at **125M and 1.3B**,
   core measurement on **1×B200** (isolates per-GPU compute from comms), one 4-GPU confirm per precision.

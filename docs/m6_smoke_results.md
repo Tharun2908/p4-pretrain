@@ -43,8 +43,10 @@ not portable installation instructions.
 - FP8: DelayedScaling, HYBRID, amax history 16
 - NVFP4: default NVFP4BlockScaling recipe
 
-Quantized layer activation was checked, but executed low-precision
-GEMM kernels have not yet been independently verified by profiling.
+Initial smoke tests verified quantized-layer activation. Subsequent
+profiling confirmed NVFP4 block-scaled CUTLASS GEMMs and FP8
+quantization kernels. Exact FP8 GEMM operand precision remains
+unconfirmed. See `docs/m6_results.md`.
 
 ## Standalone linear-layer observations
 
@@ -111,7 +113,7 @@ All modes completed 12 optimizer updates with finite losses and
 gradients. The synthetic random targets do not establish learning
 convergence. The observed memory differences are negligible.
 
-## Remaining validation
+## Validation remaining after the initial smoke tests
 
 - Verify actual GEMM kernels via profiling.
 - Integrate precision selection into the main training runner.

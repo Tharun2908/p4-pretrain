@@ -1,6 +1,6 @@
 # M6 — B200 Mixed-Precision Pretraining Protocol
 
-Status: GPT-125M single-B200 correctness smoke tests completed; throughput benchmarking pending. See `docs/m6_smoke_results.md`.
+Status: Single-B200 correctness, kernel profiling, and GPT-125M / GPT-1.3B benchmark matrix completed. Four-GPU confirmation and real-data convergence pending. See `docs/m6_results.md` and `docs/m6_smoke_results.md`.
 
 ## Objective
 
@@ -36,44 +36,45 @@ Current stack:
 - CUDA runtime 12.8
 - cuDNN 9.10.2
 - B200 SM 10.0
-- CUDA toolkit 12.8 and development headers installed in the M6 pod
+- CUDA toolkit 12.8 and development headers used for the original Transformer Engine extension build
 - Transformer Engine 2.19 validated in isolated `/workspace/envs/p4-m6`
 - Transformer Engine PyTorch extension compiled locally
 
 The original pinned environment `/workspace/envs/p4` remains unchanged.
-The CUDA toolkit installation resides in the pod container and may
-need to be recreated if the container is replaced.
+The replacement pod did not retain the CUDA toolkit, but the compiled
+Transformer Engine extension remained usable in the persistent venv.
+Rebuilding the extension may require restoring toolkit headers and nvcc.
 
 Do not modify the pinned baseline environment blindly.
 Record package versions, toolkit, and image provenance.
 
 ## Correctness checklist
 
-- [ ] Forward and backward complete on a tiny model.
+- [x] Forward and backward complete on a tiny model.
 - [ ] Actual low-precision kernels/recipes are verified.
-- [ ] Tied embedding/output weights remain tied.
-- [ ] Loss and gradient values are finite.
-- [ ] Optimizer parameters update correctly.
-- [ ] Quantization/scaling and higher-precision exceptions documented.
-- [ ] Short-run loss trajectories compared on identical tokens.
+- [x] Tied embedding/output weights remain tied.
+- [x] Loss and gradient values are finite.
+- [x] Optimizer parameters update correctly.
+- [x] Quantization/scaling and higher-precision exceptions documented.
+- [x] Short-run loss trajectories compared on identical tokens.
 - [ ] Any numerical divergence or overflow investigated.
 
 ## Controlled benchmarking checklist
 
-- [ ] Same architecture, initialization, and seed.
-- [ ] Same dataset and token ordering.
-- [ ] Same sequence length and effective global batch.
-- [ ] Same optimizer, LR schedule, and gradient clipping.
-- [ ] Same GPU count, warmup, and measured-step budget.
-- [ ] Compiler and attention backend differences recorded.
-- [ ] Steady-state timing excludes compilation and initialization.
-- [ ] Multiple measurements for representative configurations.
-- [ ] Aggregate and per-GPU tokens/sec, step latency, and peak allocated memory reported.
+- [x] Same architecture, initialization, and seed.
+- [x] Same dataset and token ordering.
+- [x] Same sequence length and effective global batch.
+- [x] Same optimizer, LR schedule, and gradient clipping.
+- [x] Same GPU count, warmup, and measured-step budget.
+- [x] Compiler and attention backend differences recorded.
+- [x] Steady-state timing excludes compilation and initialization.
+- [x] Multiple measurements for representative configurations.
+- [x] Aggregate and per-GPU tokens/sec, step latency, and peak allocated memory reported.
 - [ ] Training and held-out validation loss compared where valid evaluation data exists.
 - [ ] Optional GPU power and energy/token measured with a documented sampling method.
-- [ ] Loss, gradient norms, and NaN/Inf behavior reported.
-- [ ] MFU denominators and precision assumptions documented.
-- [ ] Precision speedups compared to an appropriate BF16 control.
+- [x] Loss, gradient norms, and NaN/Inf behavior reported.
+- [x] MFU denominators and precision assumptions documented.
+- [x] Precision speedups compared to an appropriate BF16 control.
 
 ## Prediction discipline
 
