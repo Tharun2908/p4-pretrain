@@ -119,3 +119,13 @@ def test_verify_backend_rejects_fused_attention_when_math_requested():
 def test_verify_backend_rejects_empty_profile_for_explicit_backend():
     with pytest.raises(RuntimeError):
         train.verify_backend("cudnn", [])
+
+
+def test_m6_precision_defaults_to_original_bf16():
+    assert train.parse_args([]).precision == "bf16"
+
+
+@pytest.mark.parametrize("precision", ["te-bf16", "fp8", "nvfp4"])
+def test_m6_te_modes_reject_cpu(precision):
+    with pytest.raises(SystemExit, match="require CUDA"):
+        train.main(SMOKE + ["--precision", precision])

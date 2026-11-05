@@ -221,6 +221,12 @@ def parse_args(argv=None):
     p.add_argument("--model", default="gpt-125m", choices=sorted(ALL_MODELS))
     p.add_argument("--device", default="auto", help="auto | cuda | cpu")
     p.add_argument("--compile", action="store_true")
+    p.add_argument(
+        "--precision",
+        choices=["bf16", "te-bf16", "fp8", "nvfp4"],
+        default="bf16",
+        help="M6 precision mode; bf16 preserves the original implementation",
+    )
     p.add_argument("--strategy", choices=["ddp", "zero1", "fsdp-grad", "fsdp-full", "tp", "tp-dp"],
                    default="ddp", help="Distributed training strategy")
     p.add_argument("--deterministic", action="store_true",
@@ -271,6 +277,16 @@ def main(argv=None) -> dict:
         device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     on_cuda = device.startswith("cuda")
     cfg = ALL_MODELS[args.model]
+
+    if args.precision != "bf16":
+        if not on_cuda:
+            raise SystemExit("M6 Transformer Engine precision modes require CUDA")
+        if world != 1 or args.strategy != "ddp":
+            raise SystemExit("M6 Transformer Engine modes currently support one GPU only")
+        if args.compile:
+            raise SystemExit("M6 Transformer Engine with torch.compile is not yet validated")
+        if args.grad_accum != 1:
+            raise SystemExit("M6 Transformer Engine gradient accumulation is not yet validated")
     if args.strategy != "ddp":
         if world < 2 or not on_cuda:
             raise SystemExit("Sharded strategies require at least two CUDA ranks for M4")
@@ -348,7 +364,19 @@ def main(argv=None) -> dict:
                   block_size=cfg.block_size, tokens_per_step=tokens_per_step,
                   steps=args.steps, bench_warmup=args.bench_warmup, log_every=args.log_every,
                   lr=args.lr, weight_decay=args.weight_decay, grad_clip=args.grad_clip,
-                  precision="bf16" if on_cuda else "fp32", seed=args.seed)
+                  precision=(args.precision if on_cuda else "fp32"), seed=args.seed)
+
+    if args.precision != "bf16":
+        config.update(
+            te_linear_input_dtype="bf16",
+            te_converted_projections_per_block=4,
+            te_recipe={
+                "te-bf16": "none",
+                "fp8": "DelayedScaling(HYBRID, amax_history_len=16)",
+                "nvfp4": "NVFP4BlockScaling(default)",
+            }[args.precision],
+            low_precision_scope="internal GPT block linear projections only",
+        )
 
     if args.strategy in ("tp", "tp-dp"):
         config.update(
@@ -379,6 +407,13 @@ def main(argv=None) -> dict:
         torch.set_float32_matmul_precision("high")
 
     model = GPT(cfg).to(device)
+
+    if args.precision != "bf16":
+        from m6_precision import convert_internal_linears
+
+        converted = convert_internal_linears(model)
+        assert converted == 4 * cfg.n_layer
+
     raw_model = model
 
     # Capture identity and matrix classification BEFORE FSDP sharding.
@@ -499,12 +534,46 @@ def main(argv=None) -> dict:
     else:
         amp = attn = nullcontext                 # CPU smoke test: fp32, default attention
 
+    te_module = None
+    te_recipe = None
+
+    if args.precision != "bf16":
+        import transformer_engine.pytorch as te_module
+
+        if args.precision == "fp8":
+            from transformer_engine.common.recipe import DelayedScaling, Format
+            te_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID,
+                amax_history_len=16,
+            )
+        elif args.precision == "nvfp4":
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+            te_recipe = NVFP4BlockScaling()
+
     @contextmanager
     def fwd_ctx():
         with amp(), attn():
-            yield
+            if te_module is None:
+                yield
+            else:
+                with te_module.autocast(
+                    enabled=te_recipe is not None,
+                    recipe=te_recipe,
+                ):
+                    yield
 
-    peak, peak_label = (peak_for("bf16") if on_cuda else (0.0, "cpu: MFU not applicable"))
+    if on_cuda and args.precision in ("fp8", "nvfp4"):
+        # Most of this model still uses BF16 operations. Dividing all
+        # estimated model FLOPs by FP8/FP4 hardware peak would not be
+        # a valid end-to-end MFU measurement.
+        peak = 0.0
+        peak_label = "mixed precision: MFU pending per-operation FLOP accounting"
+    else:
+        peak, peak_label = (
+            peak_for("bf16")
+            if on_cuda
+            else (0.0, "cpu: MFU not applicable")
+        )
     meter = ThroughputMeter(flops_per_token=cfg.flops_per_token, peak_flops=peak,
                             world_size=world, warmup=0, peak_label=peak_label)
 
