@@ -184,6 +184,74 @@ transferring at three-quarters of achievable bandwidth.
 - **Limit:** comparison with the earlier A100 result is cross-generation and uses different best message sizes; it is not a controlled hardware-only speedup.
 - **Artifacts:** `runs/M0-B200-001.json`, `runs/M0-B200-002.json`.
 
+### M0-B200 algorithm comparison — Ring vs NVLS vs AUTO, 2026-11-05
+
+- **Hardware:** 4×B200 on `cl-worker36`, all GPU pairs `NV18`.
+- **Protocol:** FP32 NCCL all-reduce, 1 MiB–2 GiB, 5 warmup +
+  20 measured iterations per size, slowest-rank timing.
+- **Controls:** `NCCL_ALGO=Ring`, `NCCL_ALGO=NVLS`, and algorithm
+  unset for automatic selection. NCCL INFO logs verified actual
+  algorithms and protocols.
+- **Prediction:** Each run recorded its forecast before execution.
+
+| Run | Prediction at 2 GiB | Actual algbw at 2 GiB | Ring-equivalent busbw | Algbw at 32 MiB |
+|---|---|---:|---:|---:|
+| M0-B200-RING-001 | 300 GB/s (270–330) | 432.1 GB/s | 648.2 GB/s | 281.5 GB/s |
+| M0-B200-NVLS-002 | 500 GB/s (450–550) | 428.1 GB/s | 642.1 GB/s | 174.6 GB/s |
+| M0-B200-AUTO-001 | 430 GB/s (410–450) | 432.9 GB/s | 649.4 GB/s | 281.5 GB/s |
+| M0-B200-RING-002 | 432 GB/s (420–445) | 434.2 GB/s | 651.3 GB/s | 281.8 GB/s |
+
+**Prediction gaps and findings**
+
+- Original Ring prediction was too pessimistic: 432.1 vs
+  300 GB/s (+44.0%). Ring nearly matched the earlier AUTO baseline.
+- NVLS prediction was also optimistic: 428.1 vs 500 GB/s
+  (−14.4%).
+- AUTO matched its prediction: 432.9 vs 430 GB/s (+0.7%).
+- Controlled Ring repeat matched its prediction:
+  434.2 vs 432 GB/s (+0.5%).
+- Under the common corrected timing implementation, NVLS was
+  38.0% slower than Ring at 32 MiB, but only 1.4% slower
+  at 2 GiB.
+- Automatic NCCL selection used **Ring at every tested message
+  size**. Its protocol progressed from LL to LL128 to SIMPLE.
+- NCCL's reported NVLS capability and multicast initialization
+  do **not** imply NVLS was chosen for automatic all-reduce.
+
+**Failed attempt and instrumentation correction**
+
+The first forced-NVLS attempt (`M0-B200-NVLS-001`) failed
+without producing a completed JSON artifact. NCCL reported
+that its forced NVLS algorithm had no supported
+`ncclFloat64` all-reduce reduction for the benchmark's
+timing synchronization. The measured FP32 collective had
+already executed with NVLS.
+
+Commit `7592b06` replaced the timing FP64 MAX all-reduce
+with rank-indexed FP32 SUM and a local maximum. This
+preserves slowest-rank timing without changing the measured
+FP32 message all-reduce. The corrected NVLS run succeeded.
+The Ring repeat provides a same-instrumentation comparison;
+the earlier Ring-001 run used the original timing reduction.
+
+**Scope and limitations**
+
+These are single-node, single-sweep observations, not
+evidence that Ring universally outperforms NVLS. No
+per-algorithm bottleneck profiling was performed. The
+reported bus bandwidth is a ring-equivalent convention,
+not measured physical NVLink traffic. These 20-iteration
+measurements do not establish statistical significance.
+
+**Artifacts:** `runs/M0-B200-RING-001.json`,
+`runs/M0-B200-NVLS-002.json`,
+`runs/M0-B200-AUTO-001.json`,
+`runs/M0-B200-RING-002.json`.
+Detailed NCCL logs remain outside Git under
+`/workspace/p4/nccl-algo-logs/`.
+
+---
+
 ### M1 integration checks — 2026-10-31 (SMOKE ONLY; NOT performance baselines)
 
 - **Hardware / code:** 1× NVIDIA B200, `cl-worker36`; driver 580.196.07; PyTorch 2.8.0+cu128; pytest 9.2.0; initial GPU validation at commit `3b21eb7`.

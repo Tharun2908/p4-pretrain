@@ -28,12 +28,31 @@ quantitative performance forecast. The original prediction
 is preserved in the JSON record, not rewritten after
 observing the result.
 
-**NVLS limitation:** NCCL reported NVLS capability, but
-the available evidence does not establish which algorithm
-handled each message size. Ring-equivalent bus bandwidth
-is a reporting convention, not a direct measurement of
-physical NVLink traffic. A controlled algorithm comparison
-remains a follow-up experiment.
+**NCCL algorithm follow-up (2026-11-05):** A controlled
+Ring/NVLS/AUTO comparison resolved the earlier uncertainty.
+NCCL logs confirmed that automatic selection used Ring at
+every tested message size.
+
+| Mode | 32 MiB algbw | 2 GiB algbw | 2 GiB ring-equivalent busbw |
+|---|---:|---:|---:|
+| Ring, corrected timing | 281.8 GB/s | 434.2 GB/s | 651.3 GB/s |
+| Forced NVLS | 174.6 GB/s | 428.1 GB/s | 642.1 GB/s |
+| Automatic | 281.5 GB/s | 432.9 GB/s | 649.4 GB/s |
+
+At 32 MiB, NVLS was 38.0% slower than Ring. At 2 GiB,
+the gap narrowed to 1.4%. The original NVLS run failed
+because the timing instrumentation attempted an unsupported
+FP64 all-reduce; the corrected FP32 SUM timing implementation
+succeeded. A Ring repeat under the corrected implementation
+provided the controlled comparison.
+
+These results apply to this single-node FP32 workload.
+Ring-equivalent bus bandwidth is not a direct measurement
+of physical NVLink traffic.
+
+**Follow-up artifacts:** `runs/M0-B200-RING-001.json`,
+`runs/M0-B200-RING-002.json`, `runs/M0-B200-NVLS-002.json`,
+and `runs/M0-B200-AUTO-001.json`.
 
 **Artifacts:** `runs/M0-B200-001.json`,
 `runs/M0-B200-002.json`.
