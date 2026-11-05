@@ -57,7 +57,7 @@
     "step_time_p50_ms": 192.519,
     "step_time_p95_ms": 204.673,
     "measured_steps": 150,
-    "warmup_steps_discarded": 0,
+    "warmup_steps_discarded": 50,
     "timing_mode": "windowed",
     "final_loss": 10.619937896728516,
     "min_loss": 10.619937896728516,
@@ -85,5 +85,16 @@
     "wall_clock_s": 55.3
   },
   "notes": "",
-  "outcome": ""
+  "outcome": "",
+  "metadata_corrections": [
+    {
+      "date": "2026-11-05",
+      "field": "metrics.warmup_steps_discarded",
+      "original_value": 0,
+      "corrected_value": 50,
+      "reason": "The training loop excluded configured warmup windows, but ThroughputMeter was initialized with warmup=0. The exported metadata was incorrect.",
+      "measurement_values_unchanged": true,
+      "original_record_preserved": true
+    }
+  ]
 }

@@ -704,6 +704,7 @@ def main(argv=None) -> dict:
                 break
 
     extra = {"compile_s": (round(compile_s, 2) if compile_s is not None else None), "first_loss": first_loss,
+             "warmup_steps_discarded": args.bench_warmup,
              "attn_kernels_observed": kernels,
              "peak_mem_gb_per_rank": mem_per_rank_gb if on_cuda else None}
     out = {**meter.as_dict(), **extra}
