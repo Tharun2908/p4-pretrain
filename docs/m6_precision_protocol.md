@@ -1,6 +1,6 @@
 # M6 — B200 Mixed-Precision Pretraining Protocol
 
-Status: implementation planning; no M6 results collected.
+Status: GPT-125M single-B200 correctness smoke tests completed; throughput benchmarking pending. See `docs/m6_smoke_results.md`.
 
 ## Objective
 
@@ -36,11 +36,13 @@ Current stack:
 - CUDA runtime 12.8
 - cuDNN 9.10.2
 - B200 SM 10.0
-- nvcc and CUDA development headers absent
+- CUDA toolkit 12.8 and development headers installed in the M6 pod
+- Transformer Engine 2.19 validated in isolated `/workspace/envs/p4-m6`
+- Transformer Engine PyTorch extension compiled locally
 
-Transformer Engine 2.19 is a compatibility candidate.
-Its PyTorch extension and required development environment
-must be validated before installation.
+The original pinned environment `/workspace/envs/p4` remains unchanged.
+The CUDA toolkit installation resides in the pod container and may
+need to be recreated if the container is replaced.
 
 Do not modify the pinned baseline environment blindly.
 Record package versions, toolkit, and image provenance.

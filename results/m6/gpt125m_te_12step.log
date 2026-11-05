@@ -1,0 +1,61 @@
+=== M6 controlled training comparison ===
+GPU: NVIDIA B200
+Model: gpt-125m
+Steps: 12
+Sequence length: 128
+Micro-batch size: 1
+Precision boundary: BF16 for all TE linears
+
+=== BF16 ===
+Quantized TE layers: 0/48
+Step  0 | loss=10.989746 | grad_norm=24.4858
+Step  1 | loss=10.957520 | grad_norm=8.3204
+Step  2 | loss=11.000488 | grad_norm=4.6826
+Step  5 | loss=10.921387 | grad_norm=2.8222
+Step  8 | loss=10.899902 | grad_norm=2.7116
+Step 11 | loss=10.969238 | grad_norm=2.6864
+Peak allocated memory: 2.388 GiB
+[PASS] BF16: 12 optimizer steps
+
+=== FP8 ===
+Quantized TE layers: 48/48
+Step  0 | loss=10.978516 | grad_norm=23.8468
+Step  1 | loss=10.956543 | grad_norm=8.7254
+Step  2 | loss=10.998535 | grad_norm=4.8985
+Step  5 | loss=10.920898 | grad_norm=2.8434
+Step  8 | loss=10.904785 | grad_norm=2.6921
+Step 11 | loss=10.952637 | grad_norm=2.6861
+Peak allocated memory: 2.383 GiB
+[PASS] FP8: 12 optimizer steps
+
+=== NVFP4 ===
+Quantized TE layers: 48/48
+Step  0 | loss=10.998047 | grad_norm=24.5607
+Step  1 | loss=10.979980 | grad_norm=8.5940
+Step  2 | loss=10.997070 | grad_norm=4.2592
+Step  5 | loss=10.924316 | grad_norm=2.8375
+Step  8 | loss=10.896973 | grad_norm=2.7516
+Step 11 | loss=10.964844 | grad_norm=2.7022
+Peak allocated memory: 2.384 GiB
+[PASS] NVFP4: 12 optimizer steps
+
+=== Loss trajectory comparison ===
+Step     BF16         FP8          NVFP4
+  0   10.989746   10.978516   10.998047
+  1   10.957520   10.956543   10.979980
+  2   11.000488   10.998535   10.997070
+  3   10.943848   10.944824   10.938477
+  4   10.900879   10.902832   10.901855
+  5   10.921387   10.920898   10.924316
+  6   11.033691   11.039551   11.041016
+  7   10.965820   10.964355   10.968262
+  8   10.899902   10.904785   10.896973
+  9   11.053711   11.056152   11.044434
+ 10   11.054688   11.051270   10.997070
+ 11   10.969238   10.952637   10.964844
+
+=== First-step numerical differences ===
+FP8: logits_error=28.7065%, QKV_grad_error=38.0031%
+NVFP4: logits_error=36.8936%, QKV_grad_error=49.3303%
+
+[PASS] Controlled 12-step comparison completed
