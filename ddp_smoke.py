@@ -101,9 +101,13 @@ def bench_allreduce(nbytes: int, warmup: int = 5, iters: int = 20) -> tuple[floa
     # A collective finishes when its slowest participant finishes. Rank 0's local timing
     # is not the collective's timing, so take the max across ranks. This doubles as a
     # sync point between message sizes.
-    t = torch.tensor(elapsed, dtype=torch.float64, device=device)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    elapsed = t.item()
+    # NVLS does not support every dtype/reduction-op combination.
+    # Use FP32 SUM on rank-indexed timing values, then take the
+    # maximum locally to preserve slowest-rank timing semantics.
+    times = torch.zeros(world, dtype=torch.float32, device=device)
+    times[dist.get_rank()] = elapsed
+    dist.all_reduce(times, op=dist.ReduceOp.SUM)
+    elapsed = times.max().item()
 
     algbw = nbytes / elapsed / 1e9
     busbw = algbw * 2 * (world - 1) / world
