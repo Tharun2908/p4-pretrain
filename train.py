@@ -246,6 +246,11 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dry-run", action="store_true",
                    help="no RunRecord: no prediction needed, dirty tree allowed. Never for results.")
+    p.add_argument(
+        "--verify-ddp-replicas",
+        action="store_true",
+        help="After training, verify exact parameter equality across DDP ranks",
+    )
     p.add_argument("--run-id")
     p.add_argument("--question")
     p.add_argument("--prediction")
@@ -278,11 +283,17 @@ def main(argv=None) -> dict:
     on_cuda = device.startswith("cuda")
     cfg = ALL_MODELS[args.model]
 
+    if args.verify_ddp_replicas:
+        if args.strategy != "ddp" or world < 2:
+            raise SystemExit(
+                "--verify-ddp-replicas requires multi-rank DDP"
+            )
+
     if args.precision != "bf16":
         if not on_cuda:
             raise SystemExit("M6 Transformer Engine precision modes require CUDA")
-        if world != 1 or args.strategy != "ddp":
-            raise SystemExit("M6 Transformer Engine modes currently support one GPU only")
+        if args.strategy != "ddp":
+            raise SystemExit("M6 Transformer Engine modes currently support DDP only")
         if args.compile:
             raise SystemExit("M6 Transformer Engine with torch.compile is not yet validated")
         if args.grad_accum != 1:
@@ -559,6 +570,11 @@ def main(argv=None) -> dict:
                 with te_module.autocast(
                     enabled=te_recipe is not None,
                     recipe=te_recipe,
+                    amax_reduction_group=(
+                        dist.group.WORLD
+                        if world > 1 and args.precision == "fp8"
+                        else None
+                    ),
                 ):
                     yield
 
@@ -771,6 +787,70 @@ def main(argv=None) -> dict:
                     flush=True,
                 )
                 break
+
+    if args.verify_ddp_replicas:
+        import hashlib
+
+        local_hashes = {}
+        local_nonfinite = []
+
+        for name, param in raw_model.named_parameters():
+            value = param.detach()
+
+            if not torch.isfinite(value).all().item():
+                local_nonfinite.append(name)
+
+            # Compare raw bytes, not approximate floating-point sums.
+            data = (
+                value.contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .cpu()
+                .numpy()
+                .tobytes()
+            )
+
+            local_hashes[name] = hashlib.sha256(data).hexdigest()
+
+        gathered = [None] * world
+
+        dist.all_gather_object(
+            gathered,
+            (local_hashes, local_nonfinite),
+        )
+
+        all_names = sorted(
+            set().union(*(set(item[0]) for item in gathered))
+        )
+
+        mismatched = [
+            name for name in all_names
+            if len({item[0].get(name) for item in gathered}) != 1
+        ]
+
+        nonfinite = [
+            (rank_id, names)
+            for rank_id, (_, names) in enumerate(gathered)
+            if names
+        ]
+
+        if mismatched or nonfinite:
+            if master:
+                print(
+                    "[M6 DDP VERIFY] FAILED",
+                    "mismatched:", mismatched[:10],
+                    "nonfinite:", nonfinite[:5],
+                    flush=True,
+                )
+            raise RuntimeError("DDP parameter verification failed")
+
+        say(
+            "[M6 DDP VERIFY] PASS: "
+            f"{len(all_names)} parameter tensors "
+            f"identical across {world} ranks; "
+            "all parameters finite",
+            flush=True,
+        )
 
     extra = {"compile_s": (round(compile_s, 2) if compile_s is not None else None), "first_loss": first_loss,
              "warmup_steps_discarded": args.bench_warmup,
