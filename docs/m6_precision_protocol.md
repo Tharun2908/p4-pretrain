@@ -1,6 +1,6 @@
 # M6 — B200 Mixed-Precision Pretraining Protocol
 
-Status: Single-B200 correctness, kernel profiling, and GPT-125M / GPT-1.3B benchmark matrix completed. Four-GPU confirmation and real-data convergence pending. See `docs/m6_results.md` and `docs/m6_smoke_results.md`.
+Status: Single-B200 and four-B200 precision benchmark matrices completed, with distributed parameter-equality verification. Real-data convergence, optimizer/scaling-state validation, and exact FP8 GEMM operand verification remain pending. See `docs/m6_results.md` and `docs/m6_smoke_results.md`.
 
 ## Objective
 

@@ -4,8 +4,8 @@
 
 **Date:** 2026-11-05
 
-**Status:** Single-GPU correctness and benchmark matrix completed.
-Four-GPU precision confirmation and real-data convergence evaluation remain pending.
+**Status:** Single-GPU and four-GPU benchmark matrices completed.
+Real-data convergence and selected low-precision state validations remain pending.
 
 The same GPT architecture was compared at two model sizes using native BF16,
 Transformer Engine BF16, FP8, and NVFP4.
@@ -83,6 +83,82 @@ Both low-precision modes also reduced peak allocated GPU memory.
 These are peak allocated-memory measurements, not total device memory,
 reserved allocator memory, or checkpoint size.
 
+## Four-GPU GPT-1.3B DDP results
+
+### Protocol
+
+- Four NVIDIA B200 GPUs on one node
+- Full GPT-1.3B replica on each rank
+- Micro-batch 8 per GPU; global tokens/step 32,768
+- Sequence length 1,024
+- Eager execution, no gradient accumulation
+- Seed 1337; rank-specific synthetic training batches
+- 20 warmup and 80 measured optimizer steps
+- Identical precision-independent training configuration
+- Exact model-parameter verification after training
+
+### Measured results
+
+| Precision | Trial | Tokens/s | vs TE BF16 | p50 ms | p95 ms | Peak GB/GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| TE BF16 | 1 | 293,397.4 | 1.0000x | 111.777 | 111.961 | 43.252 |
+| TE BF16 | 2 | 293,999.4 | 1.0000x | 111.457 | 111.735 | 43.252 |
+| FP8 | 1 | 343,722.9 | 1.1715x | 95.254 | 95.964 | 40.031 |
+| FP8 | 2 | 344,077.0 | 1.1703x | 95.237 | 95.315 | 40.031 |
+| NVFP4 | 1 | 314,354.0 | 1.0714x | 101.555 | 113.934 | 38.951 |
+| NVFP4 | 2 | 319,308.8 | 1.0861x | 101.300 | 112.048 | 38.951 |
+
+All three precision modes passed four-GPU correctness tests.
+For GPT-1.3B, all 292 parameter tensors were bitwise identical
+across four ranks at the end of each benchmark, and all checked
+model parameter values were finite.
+
+These tests do not independently establish equality of optimizer
+states or Transformer Engine's internal scaling histories.
+
+### Prediction versus observation
+
+- TE BF16 first run: predicted approximately 285,000 tokens/s;
+  actual 293,397 tokens/s, approximately 2.95% above prediction.
+- FP8 first run: predicted approximately 310,000 tokens/s;
+  actual 343,723 tokens/s, approximately 10.88% above prediction.
+- NVFP4 first run: predicted approximately 325,000 tokens/s;
+  actual 314,354 tokens/s, approximately 3.28% below prediction.
+
+Across paired four-GPU trials, FP8 outperformed TE BF16 by
+approximately 17.0–17.2%, and NVFP4 by approximately 7.1–8.6%.
+
+FP8 was fastest in both trials. NVFP4 achieved the lowest
+peak allocated GPU memory per rank.
+
+TE BF16 throughput differed by 0.21% between trials, FP8 by
+0.10%, and NVFP4 by 1.58%. Intermittent slow windows persisted
+in NVFP4. Two trials per mode are insufficient for statistical
+confidence intervals or broad performance generalizations.
+
+### Weak-scaling interpretation
+
+The per-GPU micro-batch size remained eight while GPU count
+increased from one to four, making this a weak-scaling comparison.
+
+Using the second single-GPU FP8 trial as reference, four-GPU
+FP8 scaling efficiency was approximately 94.4%. That single-GPU
+reference experienced slow timing windows, so this ratio may
+overstate efficiency relative to uninterrupted steady-state
+single-GPU performance.
+
+Differences in scaling efficiency cannot be attributed solely
+to collective communication without further profiling.
+
+The distributed benchmark artifacts are:
+
+- `runs/M6-1P3B-DDP4-TEBF16-001.json`
+- `runs/M6-1P3B-DDP4-TEBF16-002.json`
+- `runs/M6-1P3B-DDP4-FP8-001.json`
+- `runs/M6-1P3B-DDP4-FP8-002.json`
+- `runs/M6-1P3B-DDP4-NVFP4-001.json`
+- `runs/M6-1P3B-DDP4-NVFP4-002.json`
+
 ## Kernel-level verification
 
 At GPT-125M, the CUDA profiler showed:
@@ -154,7 +230,7 @@ assessment and milestone status.
 
 1. Confirm exact FP8 GEMM operand precision with stronger kernel evidence.
 2. Conduct longer real-data training and validation comparisons.
-3. Run four-GPU precision correctness and scaling experiments.
+3. Verify optimizer-state and FP8 scaling-history agreement across ranks.
 4. Characterize intermittent timing variation if further performance
    attribution is necessary.
 5. Incorporate results into the final P4 training writeup.

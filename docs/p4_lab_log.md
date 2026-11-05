@@ -60,7 +60,7 @@ All hardware is **4×B200 on one node** from M1 onward (DEC-005). Sizes per DEC-
 | M3 | DDP 4-way + scaling efficiency table | 4 | ✅ Seven measured DDP runs; synchronization, deterministic replay checks, and results documentation completed | — |
 | M4 | FSDP / ZeRO-1,2,3 — overhead **trend across 125M→1.3B** | 4 | ✅ Core ZeRO-1/2/3 benchmarks completed at both sizes; follow-ups documented | — |
 | M5 | 2-way TP **at 1.3B** + checkpoint/resume | 2 / 4 | ✅ TP and hybrid correctness, checkpoint recovery, benchmarks, and documentation committed | — |
-| M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | 🟡 Single-GPU benchmarks and profiling completed; four-GPU confirmation pending | Four-GPU precision validation and real-data convergence |
+| M6 | bf16→fp8→fp4 ablation at 125M **and** 1.3B | **1** core + 4 confirm | 🟡 Single- and four-GPU benchmark matrices completed | Real-data convergence and remaining state/kernel validation |
 | M7 | MFU before→after with diagnosed bottleneck | 4 | ⬜ not started | M3 |
 | M8 | `docs/training.md` + README + writeup | 0 | 🟡 M0/M1/M3/M4/M5 results consolidated; final M6/M7 integration and writeup pending | M6, M7 |
 
@@ -598,6 +598,53 @@ differences should not be interpreted as definitive strategy rankings.
 
 ---
 
+
+### M6 — Four-GPU precision confirmation, 2026-11-05
+
+**Question:** Do the GPT-1.3B FP8 and NVFP4 throughput
+advantages survive four-GPU DDP synchronization?
+
+**Protocol:** Four B200 GPUs, micro-batch 8 per rank,
+sequence length 1024, 20 warmup and 80 measured steps,
+eager execution, seed 1337, and exact replica verification.
+
+**Original predictions and measured results:**
+
+- TE BF16: predicted 285,000; measured 293,397 tokens/s.
+- FP8: predicted 310,000; measured 343,723 tokens/s.
+- NVFP4: predicted 325,000; measured 314,354 tokens/s.
+- Each mode was subsequently repeated; the original
+  predictions remain preserved in the run records.
+
+| Precision | Trial | Tokens/s | vs TE BF16 | p50 ms | p95 ms | Peak GB/GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| TE BF16 | 1 | 293,397.4 | 1.0000x | 111.777 | 111.961 | 43.252 |
+| TE BF16 | 2 | 293,999.4 | 1.0000x | 111.457 | 111.735 | 43.252 |
+| FP8 | 1 | 343,722.9 | 1.1715x | 95.254 | 95.964 | 40.031 |
+| FP8 | 2 | 344,077.0 | 1.1703x | 95.237 | 95.315 | 40.031 |
+| NVFP4 | 1 | 314,354.0 | 1.0714x | 101.555 | 113.934 | 38.951 |
+| NVFP4 | 2 | 319,308.8 | 1.0861x | 101.300 | 112.048 | 38.951 |
+
+**Findings:** FP8 > NVFP4 > TE BF16 in both trials.
+The FP8 advantage over TE BF16 was approximately 17%;
+NVFP4 improved throughput by approximately 7–9% while
+using the least peak allocated memory.
+
+**Correctness:** All 292 GPT-1.3B parameter tensors were
+bitwise identical across four ranks after training.
+The earlier four-GPU GPT-125M smoke tests also passed,
+with 148 identical parameter tensors per precision mode.
+
+**Limitations:** These are short synthetic-data benchmarks.
+Optimizer-state equality, FP8 scaling-history equality,
+real-data convergence, and full kernel-level performance
+attribution remain unverified. Single-GPU FP8 timing
+disturbances limit interpretation of weak-scaling efficiency.
+
+**Artifacts:** `docs/m6_results.md` and six committed
+`runs/M6-1P3B-DDP4-*.json` records.
+
+---
 
 ### RUN M5-DDP2-001 — DDP versus TP on two B200 GPUs
 
